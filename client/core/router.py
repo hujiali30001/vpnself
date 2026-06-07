@@ -1,15 +1,16 @@
 ﻿"""
-Furun VPN - Client Router with automatic Circuit Breaker.
+Furun VPN - Client Router with automatic Circuit Breaker and connection pool.
 
 Circuit breaker only applies to DIRECT connections.
-PROXY connections are handled by the server, which manages its own failures.
+PROXY connections are handled by the server via a connection pool, which
+manages its own failures and parallelism.
 """
 
 import asyncio
 import time
 
 from common.utils import get_logger, resolve_host, is_ip_address
-from client.core.tunnel import TunnelClient, TunnelStream
+from client.core.tunnel import TunnelPool, TunnelClient, TunnelStream
 from client.core.rule_engine import RuleEngine, Action
 from client.core.geoip import is_china_ip, is_special_ip
 from client.core.circuit_breaker import CircuitBreaker
@@ -17,13 +18,10 @@ from client.core.circuit_breaker import CircuitBreaker
 log = get_logger("client.router")
 
 
-# Module-level stream wrappers (lifted from _wrap_tunnel_stream to avoid
-# recreating class objects per stream)
-
 class _TunnelStreamWriter:
-    def __init__(self, s: TunnelStream, t: TunnelClient):
+    def __init__(self, s: TunnelStream):
         self._stream = s
-        self._tunnel = t
+        self._tunnel = s._tunnel
         self._closed = False
         self._queue = asyncio.Queue()
         self._drained = asyncio.Event()
@@ -40,7 +38,7 @@ class _TunnelStreamWriter:
                 try:
                     await self._tunnel.send_data(self._stream.stream_id, data)
                 except Exception as e:
-                    log.warning('TunnelStreamWriter send error: %s (%s)', e, type(e).__name__)
+                    log.warning("TunnelStreamWriter send error: %s (%s)", e, type(e).__name__)
                 finally:
                     self._drained.set()
         except asyncio.CancelledError:
@@ -96,21 +94,22 @@ class _TunnelStreamReader(asyncio.StreamReader):
                     break
                 self.feed_data(data)
         except Exception as e:
-            log.warning('TunnelStreamReader _feed error: %s (%s)', e, type(e).__name__)
+            log.warning("TunnelStreamReader _feed error: %s (%s)", e, type(e).__name__)
         finally:
             self.feed_eof()
 
 
-DNS_CACHE_TTL = 300  # 5-minute DNS cache
+DNS_CACHE_TTL = 300
+
 
 class Router:
     """Orchestrates traffic routing between direct and proxy paths."""
 
-    def __init__(self, tunnel: TunnelClient, rule_engine: RuleEngine):
-        self.tunnel = tunnel
+    def __init__(self, pool: TunnelPool, rule_engine: RuleEngine):
+        self.pool = pool
         self.rule_engine = rule_engine
         self.circuit_breaker = CircuitBreaker()
-        self._dns_cache: dict[str, tuple[float, str]] = {}  # host -> (expires_at, ip)
+        self._dns_cache: dict[str, tuple[float, str]] = {}
         self._stats = {
             "direct_connections": 0,
             "proxy_connections": 0,
@@ -178,7 +177,7 @@ class Router:
             if action == self.rule_engine.default_action and resolved_ip:
                 if is_china_ip(resolved_ip):
                     action = Action.DIRECT
-                elif self.tunnel.connected:
+                elif self.pool.connected:
                     action = Action.PROXY
 
         if action == Action.DIRECT and resolved_ip and self.circuit_breaker.is_blocked(resolved_ip):
@@ -216,16 +215,16 @@ class Router:
         elif action == Action.PROXY:
             self._stats["proxy_connections"] += 1
             log.debug("PROXY  %s:%d", host, port)
-            if not self.tunnel.connected:
-                log.warning("PROXY: tunnel not connected for %s:%d", host, port)
+            if not self.pool.connected:
+                log.warning("PROXY: tunnel pool not connected for %s:%d", host, port)
                 self._stats["failed_connections"] += 1
                 return None
 
             try:
-                stream = await self.tunnel.create_stream(host, port, timeout=10.0)
+                stream = await self.pool.create_stream(host, port, timeout=10.0)
                 if stream is None:
                     await asyncio.sleep(0.3)
-                    stream = await self.tunnel.create_stream(host, port, timeout=10.0)
+                    stream = await self.pool.create_stream(host, port, timeout=10.0)
                 if stream is None:
                     self._stats["failed_connections"] += 1
                     return None
@@ -236,6 +235,5 @@ class Router:
 
         return None
 
-    def _wrap_tunnel_stream(self, stream: TunnelStream) -> tuple[asyncio.StreamReader,
-                                                                   asyncio.StreamWriter]:
-        return _TunnelStreamReader(stream), _TunnelStreamWriter(stream, self.tunnel)
+    def _wrap_tunnel_stream(self, stream: TunnelStream) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        return _TunnelStreamReader(stream), _TunnelStreamWriter(stream)

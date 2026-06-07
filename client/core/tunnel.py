@@ -377,3 +377,189 @@ class TunnelClient:
                         pass
         except asyncio.CancelledError:
             pass
+"""
+Furun VPN - Client Tunnel with enhanced logging.
+"""
+
+import asyncio
+import time
+import ssl
+import socket
+from dataclasses import dataclass
+
+from common.protocol import (
+    Cmd, FRAME_HEADER_SIZE, pack_frame, unpack_frame, pack_auth, pack_connect,
+    pack_close, pack_ping, pack_pong,
+)
+from common.crypto import create_client_ssl_context
+from common.utils import get_logger
+
+log = get_logger("client.tunnel")
+
+AUTH_ACK = Cmd.CONNECT_OK
+PING_INTERVAL = 30.0
+HEALTH_CHECK_INTERVAL = 10.0  # How often to check connection health
+HEALTH_TIMEOUT = 50.0  # Max time without receiving data before considering dead
+
+POOL_DEFAULT_SIZE = 4
+POOL_MIN_SIZE = 1
+POOL_MAX_SIZE = 16
+
+# =============================================================================
+# Connection Pool
+# =============================================================================
+
+class TunnelPool:
+    """Manages multiple TunnelClient connections for parallel throughput.
+
+    Streams are distributed round-robin across connected tunnels. Each tunnel
+    auto-reconnects independently on failure.
+    """
+
+    def __init__(self, config: TunnelConfig, pool_size: int = POOL_DEFAULT_SIZE):
+        self.config = config
+        self.pool_size = max(POOL_MIN_SIZE, min(POOL_MAX_SIZE, int(pool_size)))
+        self._tunnels: list[TunnelClient] = []
+        self._rr_index = 0
+        self._rr_lock = asyncio.Lock()
+        self._running = False
+        self._on_disconnect: list[callable] = []
+        self._reconnect_tasks: dict[int, asyncio.Task] = {}
+        self._pid = 0
+
+    @property
+    def connected(self) -> bool:
+        return any(t.connected for t in self._tunnels)
+
+    @property
+    def connected_count(self) -> int:
+        return sum(1 for t in self._tunnels if t.connected)
+
+    @property
+    def stats(self) -> dict:
+        active_streams = sum(len(t._streams) for t in self._tunnels)
+        return {
+            "connected": self.connected,
+            "connected_count": self.connected_count,
+            "total_count": len(self._tunnels),
+            "active_streams": active_streams,
+        }
+
+    def on_disconnect(self, callback):
+        self._on_disconnect.append(callback)
+
+    async def connect(self) -> bool:
+        """Connect all tunnels. Returns True if at least one connected."""
+        self._running = True
+        self._tunnels = []
+
+        for _ in range(self.pool_size):
+            t = TunnelClient(self.config)
+            self._pid += 1
+            t._pool_index = self._pid
+            t.on_disconnect(self._make_on_lost(t._pool_index))
+            self._tunnels.append(t)
+
+        results = await asyncio.gather(
+            *[t.connect() for t in self._tunnels], return_exceptions=True)
+
+        connected = 0
+        for i, r in enumerate(results):
+            if r is True:
+                connected += 1
+            else:
+                log.warning("POOL: tunnel[%d] failed to connect (%s), "
+                           "will retry in background",
+                           i, r if isinstance(r, Exception) else "auth/connect failed")
+                if i not in self._reconnect_tasks:
+                    self._reconnect_tasks[i] = asyncio.create_task(
+                        self._reconnect_one(i, first=True))
+
+        log.info("POOL: %d/%d tunnels connected", connected, self.pool_size)
+        return connected > 0
+
+    async def disconnect(self):
+        self._running = False
+        for task in self._reconnect_tasks.values():
+            task.cancel()
+        self._reconnect_tasks.clear()
+        await asyncio.gather(
+            *[t.disconnect() for t in self._tunnels],
+            return_exceptions=True)
+        self._tunnels.clear()
+        for cb in self._on_disconnect:
+            try:
+                cb()
+            except Exception:
+                pass
+        log.info("POOL: all tunnels disconnected")
+
+    async def create_stream(self, target_host: str, target_port: int,
+                            timeout: float = 8.0) -> TunnelStream | None:
+        """Create a stream on the next connected tunnel (round-robin)."""
+        if not self._tunnels:
+            return None
+
+        n = len(self._tunnels)
+        async with self._rr_lock:
+            start = self._rr_index % n
+            self._rr_index += 1
+
+        for offset in range(n):
+            idx = (start + offset) % n
+            t = self._tunnels[idx]
+            if not t.connected:
+                continue
+            stream = await t.create_stream(target_host, target_port, timeout=timeout)
+            if stream is not None:
+                return stream
+            log.debug("POOL: tunnel[%d] refused stream for %s:%d, trying next",
+                     idx, target_host, target_port)
+
+        log.warning("POOL: no connected tunnel available for %s:%d",
+                   target_host, target_port)
+        return None
+
+    def _make_on_lost(self, pool_index: int):
+        def _cb():
+            self._on_tunnel_lost(pool_index)
+        return _cb
+
+    def _on_tunnel_lost(self, pool_index: int):
+        if not self._running:
+            return
+        for i, t in enumerate(self._tunnels):
+            if getattr(t, '_pool_index', None) == pool_index:
+                log.warning("POOL: tunnel[%d] lost (pid=%d), scheduling reconnect",
+                           i, pool_index)
+                if i not in self._reconnect_tasks:
+                    self._reconnect_tasks[i] = asyncio.create_task(
+                        self._reconnect_one(i))
+                break
+
+        if not self.connected and self._running:
+            log.warning("POOL: all tunnels down")
+            for cb in self._on_disconnect:
+                try:
+                    cb()
+                except Exception:
+                    pass
+
+    async def _reconnect_one(self, index: int, first: bool = False):
+        delay = POOL_RECONNECT_DELAY if not first else 5.0
+        while self._running and index < len(self._tunnels):
+            t = self._tunnels[index]
+            if t.connected:
+                break
+            await asyncio.sleep(delay)
+            if not self._running:
+                break
+            try:
+                ok = await t.connect()
+                if ok:
+                    log.info("POOL: tunnel[%d] reconnected", index)
+                    break
+            except Exception as e:
+                log.warning("POOL: tunnel[%d] reconnect failed: %s", index, e)
+            delay = min(delay * 1.5, 30.0)
+        self._reconnect_tasks.pop(index, None)

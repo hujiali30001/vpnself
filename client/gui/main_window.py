@@ -13,7 +13,7 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QLabel, QLineEdit, QPushButton, QCheckBox, QMessageBox,
-    QSystemTrayIcon, QMenu, QApplication, QGridLayout, QFileDialog,
+    QSystemTrayIcon, QMenu, QApplication, QGridLayout, QFileDialog, QSpinBox,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon, QCloseEvent, QPixmap, QPainter, QColor, QBrush
@@ -21,7 +21,7 @@ from PyQt6.QtGui import QAction, QIcon, QCloseEvent, QPixmap, QPainter, QColor, 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from common.utils import get_logger, get_data_path
-from client.core.tunnel import TunnelClient, TunnelConfig
+from client.core.tunnel import TunnelPool, TunnelClient, TunnelConfig, POOL_DEFAULT_SIZE
 from client.core.rule_engine import RuleEngine, Action
 from client.core.router import Router
 from client.core.http_proxy import HttpConnectProxy
@@ -59,6 +59,7 @@ class MainWindow(QMainWindow):
 
         self._running = False
         self._tunnel: TunnelClient | None = None
+        self._pool: TunnelPool | None = None
         self._router: Router | None = None
         self._proxy: HttpConnectProxy | None = None
         self._rule_engine = RuleEngine()
@@ -139,6 +140,13 @@ class MainWindow(QMainWindow):
         self.verify_cert_cb = QCheckBox("验证 TLS 证书（勾选=严格验证，不勾选=接受自签名）")
         self.verify_cert_cb.setChecked(self._config.get("verify_cert", False))
         config_layout.addWidget(self.verify_cert_cb, 2, 0, 1, 2)
+
+        config_layout.addWidget(QLabel("???:"), 3, 0)
+        self.pool_size_spin = QSpinBox()
+        self.pool_size_spin.setRange(1, 16)
+        self.pool_size_spin.setValue(int(self._config.get("pool_size", POOL_DEFAULT_SIZE)))
+        self.pool_size_spin.setToolTip(u"并行隧道数量，增加可提升多连接吞吐量")
+        config_layout.addWidget(self.pool_size_spin, 3, 1)
 
         layout.addWidget(config_group)
 
@@ -298,10 +306,11 @@ class MainWindow(QMainWindow):
                 connect_timeout=float(self._config.get("connect_timeout", 10)),
             )
 
-            self._tunnel = TunnelClient(tunnel_config)
+            pool_size = int(self._config.get("pool_size", POOL_DEFAULT_SIZE))
+            self._pool = TunnelPool(tunnel_config, pool_size)
             # Auto-reconnect when tunnel drops
-            self._tunnel.on_disconnect(lambda: self._run_async(self._auto_reconnect()))
-            connected = await self._tunnel.connect()
+            self._pool.on_disconnect(lambda: self._run_async(self._auto_reconnect()))
+            connected = await self._pool.connect()
 
             if not connected:
                 self.status_changed.emit("disconnected")
@@ -310,7 +319,7 @@ class MainWindow(QMainWindow):
 
             log.info("加密隧道已建立")
 
-            self._router = Router(self._tunnel, self._rule_engine)
+            self._router = Router(self._pool, self._rule_engine)
 
             proxy_host = self._config.get("socks5_host", "127.0.0.1")
             proxy_port = int(self._config.get("socks5_port", 8080))
@@ -341,9 +350,9 @@ class MainWindow(QMainWindow):
             await asyncio.sleep(delay)
             if not self._running:
                 return
-            if self._tunnel:
+            if self._pool:
                 try:
-                    ok = await self._tunnel.connect()
+                    ok = await self._pool.connect()
                     if ok:
                         log.info("auto-reconnect OK")
                         self.status_changed.emit("connected")
@@ -365,9 +374,9 @@ class MainWindow(QMainWindow):
                 await self._proxy.stop()
                 self._proxy = None
 
-            if self._tunnel:
-                await self._tunnel.disconnect()
-                self._tunnel = None
+            if self._pool:
+                await self._pool.disconnect()
+                self._pool = None
 
             self._router = None
 
@@ -392,6 +401,7 @@ class MainWindow(QMainWindow):
             self._config["verify_cert"] = self.verify_cert_cb.isChecked()
             self._config["auto_set_system_proxy"] = self.system_proxy_cb.isChecked()
             self._config["auto_connect"] = self.auto_connect_cb.isChecked()
+            self._config["pool_size"] = self.pool_size_spin.value()
             save_config(self._config)
 
             self._start_async_loop()
@@ -405,11 +415,14 @@ class MainWindow(QMainWindow):
             stats = self._router.stats
             self.stats_updated.emit(stats)
 
-        if self._tunnel:
-            ts = self._tunnel.stats
+        if self._pool:
+            ts = self._pool.stats
+            active = ts.get("active_streams", 0)
+            con = ts.get("connected_count", 0)
+            tot = ts.get("total_count", 0)
             self.tunnel_status_label.setText(
                 f"隧道: {'正常' if ts['connected'] else '断开'} "
-                f"({ts['active_streams']} 个流)"
+                f"({con}/{tot} 个隧道, {active} 个流)"
             )
             if self._connect_start_time and ts['connected']:
                 elapsed = int(time.time() - self._connect_start_time)
@@ -516,6 +529,7 @@ class MainWindow(QMainWindow):
             self.host_input.setEnabled(False)
             self.port_input.setEnabled(False)
             self.psk_input.setEnabled(False)
+            self.pool_size_spin.setEnabled(False)
             self.system_proxy_cb.setEnabled(True)
             self.tray_connect_action.setText("断开连接")
             port = self._config.get("socks5_port", 1080)
@@ -529,6 +543,7 @@ class MainWindow(QMainWindow):
             self.host_input.setEnabled(True)
             self.port_input.setEnabled(True)
             self.psk_input.setEnabled(True)
+            self.pool_size_spin.setEnabled(True)
             if not self._running:
                 self.system_proxy_cb.setEnabled(False)
             self.tray_connect_action.setText("连接")
