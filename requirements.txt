@@ -1,0 +1,11 @@
+﻿# Furun VPN - Requirements
+
+# Runtime
+PyQt6>=6.5.0
+cryptography>=41.0.0
+
+# Build
+pyinstaller>=5.13.0
+
+# GeoIP (optional, for enhanced IP geolocation)
+# geoip2>=4.7.0
