@@ -109,16 +109,16 @@ class ForwardProxy:
                              write_lock: asyncio.Lock | None = None
                              ) -> ForwardRelay | None:
         """Establish a connection to target and return a relay, or None on failure."""
+            # Resolve DNS outside semaphore to avoid blocking other connections
+        loop = asyncio.get_event_loop()
+        ip = await asyncio.wait_for(
+            loop.run_in_executor(None, self._resolve, host),
+            timeout=self.DNS_TIMEOUT,
+        )
+        log.info("CONNECT %s:%d -> %s", host, port, ip)
+
         async with self._semaphore:
             try:
-                # Resolve hostname with timeout (prevents DNS hangs from blocking semaphore)
-                loop = asyncio.get_event_loop()
-                ip = await asyncio.wait_for(
-                    loop.run_in_executor(None, self._resolve, host),
-                    timeout=self.DNS_TIMEOUT,
-                )
-                log.info("CONNECT %s:%d -> %s", host, port, ip)
-
                 target_reader, target_writer = await asyncio.wait_for(
                     asyncio.open_connection(ip, port),
                     timeout=self.CONNECT_TIMEOUT,
