@@ -6,7 +6,7 @@ DNS 在服务端解析，自动区分国内直连和境外代理。
 ## 架构
 
 ```
-浏览器 --HTTP--> 本地代理 (127.0.0.1:1080) --TLS隧道--> 日本VPS --TCP--> 目标网站
+浏览器 --HTTP--> 本地代理 (127.0.0.1:1080) --TLS连接池(N条)--> 日本VPS --TCP--> 目标网站
 ```
 
 ## 快速开始
@@ -47,8 +47,7 @@ python -m PyInstaller --noconfirm server_console.spec
 | 智能路由 | 域名/IP 规则 + 中国 IP 库自动分流 |
 | HTTP 代理 | 支持 CONNECT / GET / POST 全方法 |
 | 服务端 DNS | 域名在日本侧解析，获取面向日本的最优 IP |
-| TLS 隧道 | TLS 1.2+, AES-256-GCM, 多路复用 |
-| 熔断器 | 自动学习不可达 IP，120s 冷却 |
+| TLS 连接池 | N 条并行 TLS 1.2+ 连接，轮询分发流 |
 | 自动重连 | 指数退避重试（3s ~ 15s, 最多 5 次） |
 | 健康监控 | 50s 内检测死连接，触发重连 |
 | 空闲检测 | 服务端 120s 无数据自动清理静默断开的客户端 |
@@ -69,6 +68,7 @@ python -m PyInstaller --noconfirm server_console.spec
 | verify_cert | false | 是否验证服务端 TLS 证书 |
 | auto_connect | false | 启动时自动连接 |
 | auto_set_system_proxy | true | 自动设置 Windows 系统代理 |
+| pool_size | 4 | 并行隧道数量（1-16） |
 | connect_timeout | 10 | TLS 握手超时（秒） |
 | log_level | INFO | 日志级别：DEBUG / INFO |
 
@@ -81,6 +81,6 @@ python -m PyInstaller --noconfirm server_console.spec
 | psk | （必填） | 预共享密钥 |
 | tls_cert_file | server.crt | TLS 证书路径 |
 | tls_key_file | server.key | TLS 私钥路径 |
-| max_connections | 200 | 最大并发连接数 |
+| max_connections | 500 | 最大并发出站连接数 |
 | idle_timeout | 120 | 客户端空闲超时（秒） |
 | log_level | INFO | 日志级别 |

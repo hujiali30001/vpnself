@@ -6,7 +6,7 @@ DNS resolved on server side. Automatic split routing: domestic direct, overseas 
 ## Architecture
 
 ```
-Browser --HTTP--> Local Proxy (127.0.0.1:1080) --TLS Tunnel--> Japan VPS --TCP--> Target
+Browser --HTTP--> Local Proxy (127.0.0.1:1080) --TLS Pool (N connections)--> Japan VPS --TCP--> Target
 ```
 
 ## Quick Start
@@ -47,8 +47,7 @@ python -m PyInstaller --noconfirm server_console.spec
 | Smart Routing | Domain/IP rules + China IP database auto-split |
 | HTTP Proxy | Supports CONNECT / GET / POST all methods |
 | Server-side DNS | Domain resolved in Japan, gets optimal IP for Japan VPS |
-| TLS Tunnel | TLS 1.2+, AES-256-GCM, multi-stream multiplexing |
-| Circuit Breaker | Auto-learns unreachable IPs, 120s cooldown |
+| TLS Tunnel Pool | N parallel TLS 1.2+ connections, round-robin stream distribution |
 | Auto Reconnect | Exponential backoff retry (3s ~ 15s, max 5 attempts) |
 | Health Monitor | Detects dead connections within 50s, triggers reconnect |
 | Idle Detection | Server drops silent clients after 120s |
@@ -69,6 +68,7 @@ python -m PyInstaller --noconfirm server_console.spec
 | verify_cert | false | Verify server TLS certificate |
 | auto_connect | false | Auto-connect on startup |
 | auto_set_system_proxy | true | Auto-set Windows system proxy |
+| pool_size | 4 | Parallel tunnel connections (1-16) |
 | connect_timeout | 10 | TLS handshake timeout (seconds) |
 | log_level | INFO | Log level: DEBUG / INFO |
 
@@ -81,6 +81,6 @@ python -m PyInstaller --noconfirm server_console.spec
 | psk | (required) | Pre-shared key |
 | tls_cert_file | server.crt | TLS certificate path |
 | tls_key_file | server.key | TLS private key path |
-| max_connections | 200 | Max concurrent connections |
+| max_connections | 500 | Max concurrent outbound connections |
 | idle_timeout | 120 | Client idle timeout (seconds) |
 | log_level | INFO | Log level |

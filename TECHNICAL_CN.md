@@ -21,7 +21,7 @@ router.py               --> 规则匹配 + 熔断检查 + DNS 缓存
   +-- PROXY（境外IP / 规则代理）
           |
           v
-      tunnel.py          --> 复用 TLS 隧道，多路流
+      tunnel.py          --> TLS 连接池，4-16 条并行隧道
           |
           | 二进制帧协议（9 字节头）
           v
@@ -33,7 +33,7 @@ router.py               --> 规则匹配 + 熔断检查 + DNS 缓存
 
 ## 通信协议
 
-单条 TLS 1.2+ 连接通过二进制帧协议多路复用 N 个流（大端序）：
+多条并行 TLS 1.2+ 连接承载多路复用流，通过二进制帧协议通信（大端序）。客户端使用连接池（默认 4 条隧道），轮询分发流：
 
 ```
 [0:4] uint32  帧总长度（含头部）
@@ -67,7 +67,7 @@ vpnself/
 |   |   +-- rule_editor.py      # 路由规则编辑器对话框
 |   |   +-- styles.py           # 界面样式（Catppuccin Mocha 主题）
 |   +-- core/
-|   |   +-- tunnel.py           # TLS 隧道客户端，流管理
+|   |   +-- tunnel.py           # TLS 隧道客户端，流管理，连接池
 |   |   +-- http_proxy.py       # HTTP CONNECT + GET/POST 代理
 |   |   +-- router.py           # 路由编排 + 流包装器
 |   |   +-- rule_engine.py      # 域名/IP 规则匹配引擎
@@ -79,7 +79,7 @@ vpnself/
 +-- server/                     # 服务端代码
 |   +-- console_main.py         # 控制台入口（无需 GUI）
 |   +-- tunnel_server.py        # TLS 服务端，客户端处理，帧分发
-|   +-- forward_proxy.py        # 向目标发起 TCP 连接
+|   +-- forward_proxy.py        # 向目标发起 TCP 连接（client_id 命名空间隔离）
 |   +-- config.py               # 配置加载/保存（支持 frozen 模式）
 +-- common/                     # 公共模块
 |   +-- protocol.py             # 二进制帧打包/解包
@@ -144,6 +144,15 @@ route(host, port):
 - 客户端每 30 秒发 PING，任何 120 秒无数据意味着客户端已死
 - 空闲超时关闭连接，释放资源
 
+### 连接池
+
+客户端与服务端之间维护 N 条并行 TLS 隧道（可配置，默认 4）：
+
+- **分发策略**：轮询到各已连接隧道，自动跳过断开的
+- **容错**：单条隧道断开时独立重连，不影响其他隧道
+- **服务端隔离**：每条隧道分配唯一 `client_id`；`ForwardProxy` 用 `(client_id, stream_id)` 复合键索引 relay，避免跨隧道 stream_id 冲突
+- **DNS 优化**：服务端 DNS 解析在连接信号量外执行，防止慢 DNS 阻塞其他连接
+
 ### DNS 缓存
 
 客户端 Router 中 5 分钟 TTL 的 DNS 缓存：
@@ -173,6 +182,7 @@ route(host, port):
 | 服务端空闲超时 | 120s | 客户端静默断开 |
 | 熔断冷却 | 120s | 被封 IP 解冻 |
 | 中继超时 | 10s | 一侧关闭后等待另一侧 |
+| 池隧道重连 | 5s~30s，逐条独立 | 单条隧道退避 |
 | 自动重连 | 3s~15s，最多 5 次 | 指数退避 |
 
 ## HTTPS 数据流（完整链路）
@@ -181,7 +191,7 @@ route(host, port):
 1. Chrome：    CONNECT www.google.com:443 HTTP/1.1
 2. http_proxy：解析 CONNECT -> router.route("www.google.com", 443)
 3. router：   DNS 缓存命中/未命中 -> rule_engine.evaluate -> Action.PROXY
-4. router：   tunnel.create_stream("www.google.com", 443, timeout=10.0)
+4. router：   pool.create_stream("www.google.com", 443, timeout=10.0)
 5. tunnel：   pack_connect(sid, host, port) -> 写入 TLS 隧道
 6. server：   forward_proxy.connect_target -> DNS(3s) + TCP(5s) -> 目标
 7. server：   pack_connect_ok(sid) -> 写回 CONNECT_OK

@@ -21,7 +21,7 @@ router.py               --> Rule matching + CB check + DNS cache
   +-- PROXY (overseas IP / rule match)
           |
           v
-      tunnel.py          --> Reuse TLS tunnel, multi-stream
+      tunnel.py          --> TLS connection pool, 4-16 parallel tunnels
           |
           | Binary frame protocol (9-byte header)
           v
@@ -33,7 +33,7 @@ router.py               --> Rule matching + CB check + DNS cache
 
 ## Communication Protocol
 
-Single TLS 1.2+ TCP connection multiplexes N streams via binary frame protocol (big-endian):
+Multiple parallel TLS 1.2+ TCP connections carry multiplexed streams via binary frame protocol (big-endian). Client uses a connection pool (default 4 tunnels) with round-robin stream distribution:
 
 ```
 [0:4] uint32  Total length (header + payload)
@@ -67,7 +67,7 @@ vpnself/
 |   |   +-- rule_editor.py      # Routing rule editor dialog
 |   |   +-- styles.py           # UI styles (Catppuccin Mocha theme)
 |   +-- core/
-|   |   +-- tunnel.py           # TLS tunnel client, stream management
+|   |   +-- tunnel.py           # TLS tunnel client, stream management, connection pool
 |   |   +-- http_proxy.py       # HTTP CONNECT + GET/POST proxy
 |   |   +-- router.py           # Routing orchestration + stream wrappers
 |   |   +-- rule_engine.py      # Domain/IP rule matching engine
@@ -79,7 +79,7 @@ vpnself/
 +-- server/                     # Server code
 |   +-- console_main.py         # Console entry (no GUI needed)
 |   +-- tunnel_server.py        # TLS server, client handler, frame dispatch
-|   +-- forward_proxy.py        # Outbound TCP connections to targets
+|   +-- forward_proxy.py        # Outbound TCP connections (client_id isolated)
 |   +-- config.py               # Config load/save (frozen-aware)
 +-- common/                     # Shared modules
 |   +-- protocol.py             # Binary frame pack/unpack
@@ -143,6 +143,15 @@ Server-side `_handle_client` wraps `reader.read()` with `asyncio.wait_for(timeou
 - Client sends PING every 30s, so any 120s gap means client is dead
 - Idle timeout closes connection, releases resources
 
+### Connection Pool
+
+The client maintains N parallel TLS tunnels to the server (configurable, default 4):
+
+- **Distribution**: Round-robin across connected tunnels, skipping any that are down
+- **Fault tolerance**: Each tunnel auto-reconnects independently on failure
+- **Server isolation**: Each tunnel gets a unique `client_id` on the server; `ForwardProxy` keys relays by `(client_id, stream_id)` to prevent namespace collisions
+- **DNS optimization**: Server-side DNS resolution happens outside the connection semaphore to prevent head-of-line blocking
+
 ### DNS Cache
 
 Client-side 5-minute TTL DNS cache in Router:
@@ -172,6 +181,7 @@ Read loops use position tracking (`pos` variable) instead of per-frame `buf = bu
 | Server idle timeout | 120s | Client silent disconnect |
 | Circuit breaker cooldown | 120s | Blocked IP thaw |
 | Relay timeout (HTTP) | 10s | One side closed, wait for other |
+| Pool reconnect | 5s~30s, per-tunnel | Individual tunnel backoff |
 | Auto-reconnect | 3s~15s, max 5 attempts | Exponential backoff |
 
 ## HTTPS Data Flow (Complete)
@@ -180,7 +190,7 @@ Read loops use position tracking (`pos` variable) instead of per-frame `buf = bu
 1. Chrome:     CONNECT www.google.com:443 HTTP/1.1
 2. http_proxy: Parse CONNECT -> router.route("www.google.com", 443)
 3. router:     DNS cache hit/miss -> rule_engine.evaluate -> Action.PROXY
-4. router:     tunnel.create_stream("www.google.com", 443, timeout=10.0)
+4. router:     pool.create_stream("www.google.com", 443, timeout=10.0)
 5. tunnel:     pack_connect(sid, host, port) -> write to TLS tunnel
 6. server:     forward_proxy.connect_target -> DNS(3s) + TCP(5s) -> target
 7. server:     pack_connect_ok(sid) -> write CONNECT_OK back
