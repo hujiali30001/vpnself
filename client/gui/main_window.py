@@ -141,7 +141,7 @@ class MainWindow(QMainWindow):
         self.verify_cert_cb.setChecked(self._config.get("verify_cert", False))
         config_layout.addWidget(self.verify_cert_cb, 2, 0, 1, 2)
 
-        config_layout.addWidget(QLabel("???:"), 3, 0)
+        config_layout.addWidget(QLabel("连接池:"), 3, 0)
         self.pool_size_spin = QSpinBox()
         self.pool_size_spin.setRange(1, 16)
         self.pool_size_spin.setValue(int(self._config.get("pool_size", POOL_DEFAULT_SIZE)))
