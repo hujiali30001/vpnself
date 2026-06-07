@@ -24,7 +24,8 @@ class TunnelServer:
     def __init__(self, config: dict):
         self.config = config
         self.psk = config["psk"].encode("utf-8") if isinstance(config["psk"], str) else config["psk"]
-        self.forward_proxy = ForwardProxy(max_connections=config.get("max_connections", 200))
+        self.forward_proxy = ForwardProxy(max_connections=config.get("max_connections", 500))
+        self._client_id_counter = 0
         self.ssl_context: ssl.SSLContext | None = None
         self._server: asyncio.AbstractServer | None = None
         self._running = False
@@ -52,15 +53,15 @@ class TunnelServer:
         self.forward_proxy.close_all()
         log.info("=== Tunnel server stopped ===")
 
-    async def _handle_connect(self, stream_id: int, target_host: str,
+    async def _handle_connect(self, client_id: int, stream_id: int, target_host: str,
                               target_port: int, writer: asyncio.StreamWriter,
                               active_streams: dict, pending: dict,
                               deferred_close: set, write_lock: asyncio.Lock):
         """Background task: connect to target, flush buffered data, set up relay."""
-        log.debug("[S%d] CONNECT task started for %s:%d", stream_id, target_host, target_port)
+        log.debug("[C%d S%d] CONNECT task started for %s:%d", client_id, stream_id, target_host, target_port)
 
         relay = await self.forward_proxy.connect_target(
-            stream_id, target_host, target_port,
+            client_id, stream_id, target_host, target_port,
             writer, pack_connect_ok, pack_connect_fail,
             write_lock=write_lock)
 
@@ -80,7 +81,7 @@ class TunnelServer:
             if stream_id in deferred_close:
                 deferred_close.discard(stream_id)
                 log.debug("[S%d] Deferred CLOSE after buffered flush", stream_id)
-                self.forward_proxy.remove_relay(stream_id)
+                self.forward_proxy.remove_relay(client_id, stream_id)
                 relay.close()
             else:
                 task = asyncio.create_task(relay.relay_target_to_tunnel(pack_data))
@@ -88,7 +89,7 @@ class TunnelServer:
                 log.debug("[S%d] Relay task started (active streams: %d)",
                           stream_id, len(active_streams))
         else:
-            log.warning("[S%d] CONNECT FAILED for %s:%d", stream_id, target_host, target_port)
+            log.warning("[C%d S%d] CONNECT FAILED for %s:%d", client_id, stream_id, target_host, target_port)
             active_streams.pop(stream_id, None)
             pending.pop(stream_id, None)
             deferred_close.discard(stream_id)
@@ -96,7 +97,9 @@ class TunnelServer:
     async def _handle_client(self, reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter):
         peer = writer.get_extra_info("peername")
-        log.info("=== CLIENT CONNECTED: %s:%d ===", peer[0], peer[1])
+        self._client_id_counter += 1
+        client_id = self._client_id_counter
+        log.info("=== CLIENT CONNECTED: %s:%d [CID=%d] ===", peer[0], peer[1], client_id)
         try:
             sock = writer.get_extra_info('socket')
             if sock is not None:
@@ -177,7 +180,7 @@ class TunnelServer:
                                      stream_id, target_host, target_port)
                             task = asyncio.create_task(
                                 self._handle_connect(
-                                    stream_id, target_host, target_port,
+                                    client_id, stream_id, target_host, target_port,
                                     writer, active_streams,
                                     pending_data, deferred_close, write_lock))
                             active_streams[stream_id] = task
@@ -188,7 +191,7 @@ class TunnelServer:
                     elif cmd == Cmd.DATA:
                         log.debug("[CLIENT %s:%d] Frame #%d: [S%d] DATA %d bytes",
                                   peer[0], peer[1], frame_count, stream_id, len(payload))
-                        relay = self.forward_proxy.get_relay(stream_id)
+                        relay = self.forward_proxy.get_relay(client_id, stream_id)
                         if relay:
                             try:
                                 relay.target_writer.write(payload)
@@ -205,11 +208,11 @@ class TunnelServer:
                                         stream_id, len(payload))
 
                     elif cmd == Cmd.CLOSE:
-                        relay = self.forward_proxy.get_relay(stream_id)
+                        relay = self.forward_proxy.get_relay(client_id, stream_id)
                         if relay:
                             log.debug("[CLIENT %s:%d] Frame #%d: [S%d] CLOSE (relay active)",
                                      peer[0], peer[1], frame_count, stream_id)
-                            self.forward_proxy.remove_relay(stream_id)
+                            self.forward_proxy.remove_relay(client_id, stream_id)
                             task = active_streams.pop(stream_id, None)
                             if task and not task.done():
                                 task.cancel()
@@ -239,7 +242,7 @@ class TunnelServer:
             log.info("[CLIENT %s:%d] Cleaning up: %d active streams, %d pending DATA frames, %d deferred closes",
                      peer[0], peer[1], active_count, pend_buf, len(deferred_close))
             for stream_id in list(active_streams.keys()):
-                self.forward_proxy.remove_relay(stream_id)
+                self.forward_proxy.remove_relay(client_id, stream_id)
                 task = active_streams.pop(stream_id, None)
                 if task and not task.done():
                     task.cancel()

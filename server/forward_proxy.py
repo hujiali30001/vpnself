@@ -78,8 +78,18 @@ class ForwardProxy:
     def __init__(self, max_connections: int = 200):
         self.max_connections = max_connections
         self._semaphore = asyncio.Semaphore(max_connections)
-        self._active_relays: dict[int, ForwardRelay] = {}
+        self._active_relays: dict[int, ForwardRelay] = {}  # key: composite_id = (client_id << 32) | stream_id
         self._total_connections = 0
+
+    @staticmethod
+    def _make_key(client_id: int, stream_id: int) -> int:
+        """Pack client_id and stream_id into a single integer key."""
+        return (client_id << 32) | (stream_id & 0xFFFFFFFF)
+
+    @staticmethod
+    def _split_key(key: int) -> tuple[int, int]:
+        """Unpack composite key into (client_id, stream_id)."""
+        return (key >> 32, key & 0xFFFFFFFF)
 
     @property
     def stats(self) -> dict:
@@ -89,10 +99,10 @@ class ForwardProxy:
             "max_connections": self.max_connections,
         }
 
-    def get_relay(self, stream_id: int) -> ForwardRelay | None:
-        return self._active_relays.get(stream_id)
+    def get_relay(self, client_id: int, stream_id: int) -> ForwardRelay | None:
+        return self._active_relays.get(self._make_key(client_id, stream_id))
 
-    async def connect_target(self, stream_id: int, host: str, port: int,
+    async def connect_target(self, client_id: int, stream_id: int, host: str, port: int,
                              tunnel_writer: asyncio.StreamWriter,
                              pack_connect_ok_func,
                              pack_connect_fail_func,
@@ -128,7 +138,7 @@ class ForwardProxy:
                 relay = ForwardRelay(stream_id, tunnel_writer,
                                      target_reader, target_writer,
                                      write_lock=write_lock)
-                self._active_relays[stream_id] = relay
+                self._active_relays[self._make_key(client_id, stream_id)] = relay
 
                 ok_frame = pack_connect_ok_func(stream_id)
                 if write_lock:
@@ -173,8 +183,9 @@ class ForwardProxy:
             raise OSError(f"DNS resolution returned no results for {host}")
         return info[0][4][0]
 
-    def remove_relay(self, stream_id: int):
-        relay = self._active_relays.pop(stream_id, None)
+    def remove_relay(self, client_id: int, stream_id: int):
+        key = self._make_key(client_id, stream_id)
+        relay = self._active_relays.pop(key, None)
         if relay:
             relay.close()
             log.debug("Stream %d: relay removed (active: %d)",
@@ -182,6 +193,7 @@ class ForwardProxy:
 
     def close_all(self):
         count = len(self._active_relays)
-        for stream_id in list(self._active_relays.keys()):
-            self.remove_relay(stream_id)
+        for key in list(self._active_relays.keys()):
+            cid, sid = self._split_key(key)
+            self.remove_relay(cid, sid)
         log.info("All %d relays closed", count)
