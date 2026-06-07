@@ -235,7 +235,7 @@ class TunnelClient:
             await writer.drain()
             self._frame_tx += 1
         except (ConnectionError, OSError, AssertionError) as e:
-            log.error("TUNNEL: [S%d] CONNECT send failed: %s", sid, e)
+            log.warning("TUNNEL: [S%d] CONNECT send failed (%s), pool will retry", sid, e or "writer closed")
             self._streams.pop(sid, None)
             return None
 
