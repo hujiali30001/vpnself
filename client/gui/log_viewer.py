@@ -62,11 +62,13 @@ class LogViewer(QWidget):
             self.text_edit.appendPlainText(message)
 
     def append_log(self, message: str, level: str = "INFO"):
-        if level == "DEBUG" and not self.show_debug_cb.isChecked():
-            # Still store for filter toggle
-            self._all_lines.append((message, level))
-            return
         self._all_lines.append((message, level))
+        # Cap retained history to match the display block limit, so a
+        # long-running session does not grow _all_lines without bound.
+        if len(self._all_lines) > self.MAX_LINES:
+            del self._all_lines[:len(self._all_lines) - self.MAX_LINES]
+        if level == "DEBUG" and not self.show_debug_cb.isChecked():
+            return
         self.text_edit.appendPlainText(message)
         if self._auto_scroll:
             scrollbar = self.text_edit.verticalScrollBar()

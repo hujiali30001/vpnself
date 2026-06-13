@@ -109,12 +109,21 @@ class ForwardProxy:
                              write_lock: asyncio.Lock | None = None
                              ) -> ForwardRelay | None:
         """Establish a connection to target and return a relay, or None on failure."""
-            # Resolve DNS outside semaphore to avoid blocking other connections
-        loop = asyncio.get_event_loop()
-        ip = await asyncio.wait_for(
-            loop.run_in_executor(None, self._resolve, host),
-            timeout=self.DNS_TIMEOUT,
-        )
+        # Resolve DNS outside the semaphore to avoid blocking other connections.
+        # A DNS failure must still send CONNECT_FAIL, otherwise the client stream
+        # hangs until its own timeout instead of fast-failing.
+        loop = asyncio.get_running_loop()
+        try:
+            ip = await asyncio.wait_for(
+                loop.run_in_executor(None, self._resolve, host),
+                timeout=self.DNS_TIMEOUT,
+            )
+        except (asyncio.TimeoutError, OSError) as e:
+            log.warning("Stream %d: DNS resolution failed for %s: %s",
+                        stream_id, host, e)
+            await self._send_frame(tunnel_writer, write_lock,
+                                   pack_connect_fail_func(stream_id, "DNS resolution failed"))
+            return None
         log.info("CONNECT %s:%d -> %s", host, port, ip)
 
         async with self._semaphore:
@@ -141,39 +150,36 @@ class ForwardProxy:
                 self._active_relays[self._make_key(client_id, stream_id)] = relay
 
                 ok_frame = pack_connect_ok_func(stream_id)
-                if write_lock:
-                    async with write_lock:
-                        tunnel_writer.write(ok_frame)
-                        await tunnel_writer.drain()
-                else:
-                    tunnel_writer.write(ok_frame)
-                    await tunnel_writer.drain()
+                await self._send_frame(tunnel_writer, write_lock, ok_frame)
 
                 return relay
             except asyncio.TimeoutError:
                 log.warning("Stream %d: CONNECT TIMEOUT (DNS/TCP) to %s:%d",
                             stream_id, host, port)
-                fail_frame = pack_connect_fail_func(stream_id, "DNS or connection timeout")
-                if write_lock:
-                    async with write_lock:
-                        tunnel_writer.write(fail_frame)
-                        await tunnel_writer.drain()
-                else:
-                    tunnel_writer.write(fail_frame)
-                    await tunnel_writer.drain()
+                await self._send_frame(tunnel_writer, write_lock,
+                                       pack_connect_fail_func(stream_id, "Connection timeout"))
                 return None
             except (ConnectionError, OSError) as e:
                 log.warning("Stream %d: CONNECT FAILED to %s:%d: %s",
                             stream_id, host, port, e)
-                fail_frame = pack_connect_fail_func(stream_id, str(e))
-                if write_lock:
-                    async with write_lock:
-                        tunnel_writer.write(fail_frame)
-                        await tunnel_writer.drain()
-                else:
-                    tunnel_writer.write(fail_frame)
-                    await tunnel_writer.drain()
+                await self._send_frame(tunnel_writer, write_lock,
+                                       pack_connect_fail_func(stream_id, str(e)))
                 return None
+
+    @staticmethod
+    async def _send_frame(writer: asyncio.StreamWriter,
+                          write_lock: asyncio.Lock | None, frame: bytes):
+        """Write a frame to the shared tunnel writer, guarding with the lock if present."""
+        try:
+            if write_lock:
+                async with write_lock:
+                    writer.write(frame)
+                    await writer.drain()
+            else:
+                writer.write(frame)
+                await writer.drain()
+        except (ConnectionError, OSError, AssertionError):
+            pass
 
     @staticmethod
     def _resolve(host: str) -> str:

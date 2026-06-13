@@ -100,6 +100,7 @@ class _TunnelStreamReader(asyncio.StreamReader):
 
 
 DNS_CACHE_TTL = 300
+DNS_CACHE_MAX = 1024
 
 
 class Router:
@@ -132,7 +133,7 @@ class Router:
             resolved_ip = host
         else:
             try:
-                resolved_ip = await asyncio.get_event_loop().run_in_executor(
+                resolved_ip = await asyncio.get_running_loop().run_in_executor(
                     None, resolve_host, host)
             except Exception:
                 return
@@ -152,6 +153,22 @@ class Router:
             del self._dns_cache[host]
         return None
 
+    def _prune_dns_cache(self):
+        """Drop expired entries; if still over capacity, evict soonest-to-expire."""
+        if len(self._dns_cache) <= DNS_CACHE_MAX:
+            return
+        now = time.monotonic()
+        # First pass: remove anything already expired.
+        expired = [h for h, (exp, _) in self._dns_cache.items() if now >= exp]
+        for h in expired:
+            del self._dns_cache[h]
+        if len(self._dns_cache) <= DNS_CACHE_MAX:
+            return
+        # Still full: evict the entries with the earliest expiry.
+        overflow = len(self._dns_cache) - DNS_CACHE_MAX
+        for h, _ in sorted(self._dns_cache.items(), key=lambda kv: kv[1][0])[:overflow]:
+            del self._dns_cache[h]
+
     async def route(self, host: str, port: int) -> tuple[asyncio.StreamReader,
                                                                asyncio.StreamWriter] | None:
         log.debug("ROUTE %s:%d", host, port)
@@ -163,12 +180,13 @@ class Router:
             resolved_ip = self._cached_resolve(host)
             if resolved_ip is None:
                 try:
-                    resolved_ip = await asyncio.get_event_loop().run_in_executor(
+                    resolved_ip = await asyncio.get_running_loop().run_in_executor(
                         None, resolve_host, host, port)
                 except Exception:
                     resolved_ip = None
                 if resolved_ip and is_ip_address(resolved_ip):
                     self._dns_cache[host] = (time.monotonic() + DNS_CACHE_TTL, resolved_ip)
+                    self._prune_dns_cache()
 
         if resolved_ip and is_special_ip(resolved_ip):
             action = Action.DIRECT

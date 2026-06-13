@@ -108,19 +108,32 @@ def is_special_ip(ip_str: str) -> bool:
 
 
 def load_china_ip_list(file_path: str) -> int:
-    """Load additional China IP ranges from a text file. Returns count added."""
+    """Load additional China IP ranges from a text file. Returns count added.
+
+    Updates both the source range list and the precomputed network tuple so
+    the new ranges take effect immediately for is_china_ip() lookups.
+    """
+    global _CHINA_NETWORKS
     try:
         p = Path(file_path)
         if not p.exists():
             return 0
-        with open(p, "r") as f:
+        with open(p, "r", encoding="utf-8-sig") as f:
             count = 0
+            added_networks = []
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#"):
+                    try:
+                        net = ipaddress.ip_network(line, strict=False)
+                    except ValueError:
+                        log.warning("Skipping invalid CIDR in %s: %s", file_path, line)
+                        continue
                     CHINA_IP_RANGES.append(line)
+                    added_networks.append(net)
                     count += 1
             if count > 0:
+                _CHINA_NETWORKS = _CHINA_NETWORKS + tuple(added_networks)
                 log.info("Loaded %d additional China IP ranges from %s", count, file_path)
             return count
     except OSError as e:

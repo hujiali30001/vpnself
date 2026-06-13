@@ -6,6 +6,7 @@ Enhanced logging: every frame, every buffer op, every relay lifecycle event.
 import asyncio
 import ssl
 import socket
+import hmac
 
 from common.protocol import (
     Cmd, FRAME_HEADER_SIZE, unpack_frame, pack_connect_ok, pack_connect_fail,
@@ -139,7 +140,7 @@ class TunnelServer:
 
                     if not authenticated:
                         if cmd == Cmd.AUTH:
-                            if payload == self.psk:
+                            if hmac.compare_digest(payload, self.psk):
                                 authenticated = True
                                 log.info("[CLIENT %s:%d] AUTH OK (frame #%d)",
                                          peer[0], peer[1], frame_count)

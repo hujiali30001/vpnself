@@ -1,4 +1,4 @@
-﻿"""
+"""
 Furun VPN - Client Tunnel with enhanced logging.
 """
 
@@ -377,33 +377,13 @@ class TunnelClient:
                         pass
         except asyncio.CancelledError:
             pass
-"""
-Furun VPN - Client Tunnel with enhanced logging.
-"""
 
-import asyncio
-import time
-import ssl
-import socket
-from dataclasses import dataclass
 
-from common.protocol import (
-    Cmd, FRAME_HEADER_SIZE, pack_frame, unpack_frame, pack_auth, pack_connect,
-    pack_close, pack_ping, pack_pong,
-)
-from common.crypto import create_client_ssl_context
-from common.utils import get_logger
-
-log = get_logger("client.tunnel")
-
-AUTH_ACK = Cmd.CONNECT_OK
-PING_INTERVAL = 30.0
-HEALTH_CHECK_INTERVAL = 10.0  # How often to check connection health
-HEALTH_TIMEOUT = 50.0  # Max time without receiving data before considering dead
-
+# Connection pool tuning constants
 POOL_DEFAULT_SIZE = 4
 POOL_MIN_SIZE = 1
 POOL_MAX_SIZE = 16
+POOL_RECONNECT_DELAY = 5.0  # base delay between reconnect attempts (seconds)
 
 # =============================================================================
 # Connection Pool
@@ -449,8 +429,20 @@ class TunnelPool:
         self._on_disconnect.append(callback)
 
     async def connect(self) -> bool:
-        """Connect all tunnels. Returns True if at least one connected."""
+        """Connect all tunnels. Returns True if at least one connected.
+
+        Safe to call again while reconnect tasks are in flight (e.g. from a
+        GUI-driven reconnect): any pending per-tunnel reconnect tasks are
+        cancelled first so they do not index into the rebuilt tunnel list.
+        """
         self._running = True
+
+        # Cancel and clear any in-flight per-tunnel reconnect tasks from a
+        # previous session before we replace self._tunnels out from under them.
+        for task in self._reconnect_tasks.values():
+            task.cancel()
+        self._reconnect_tasks.clear()
+
         self._tunnels = []
 
         for _ in range(self.pool_size):

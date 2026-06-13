@@ -11,7 +11,7 @@ import sys
 import socket
 import ipaddress
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -189,11 +189,13 @@ def ip_in_network(ip_str: str, network_str: str) -> bool:
         return False
 
 
+def ensure_dir(path: str | Path) -> Path:
     """Ensure a directory exists and return its Path."""
     p = Path(path)
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
+def utc_timestamp() -> str:
     """Return current UTC timestamp in ISO format."""
-    return datetime.utcnow().isoformat() + "Z"
+    return datetime.now(timezone.utc).isoformat()

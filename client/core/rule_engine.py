@@ -210,6 +210,7 @@ class RuleEngine:
             ("*.googlevideo.com", 0), ("*.gvt2.com", 0), ("*.gvt1.com", 0), ("*.youtube-nocookie.com", 0), ("*.google-analytics.com", 0),
             ("*.googletagmanager.com", 0), ("*.googleadservices.com", 0),
             ("*.doubleclick.net", 0), ("*.chrome.com", 0),
+            ("*.goog", 0),  # Google TLD (CRL/PKI/certificate services)
             # YouTube
             ("youtube.com", 0), ("*.youtube.com", 0), ("*.ytimg.com", 0),
             ("*.youtu.be", 0), ("*.ggpht.com", 0),
@@ -223,6 +224,7 @@ class RuleEngine:
             ("perplexity.ai", 0), ("*.perplexity.ai", 0),
             # Social media
             ("twitter.com", 0), ("*.twitter.com", 0), ("*.twimg.com", 0), ("t.co", 0),
+            ("x.com", 0), ("*.x.com", 0),  # Twitter/X
             ("facebook.com", 0), ("*.facebook.com", 0), ("*.fbcdn.net", 0),
             ("instagram.com", 0), ("*.instagram.com", 0), ("*.cdninstagram.com", 0),
             ("discord.com", 0), ("*.discord.com", 0), ("*.discordapp.com", 0),
@@ -239,6 +241,7 @@ class RuleEngine:
             ("*.scdn.co", 0), ("twitch.tv", 0), ("*.twitch.tv", 0),
             # Crypto / Finance
             ("binance.com", 0), ("*.binance.com", 0), ("*.binance.cloud", 0),
+            ("*.bnbstatic.com", 0),  # Binance static/CDN resources
             ("bybit.com", 0), ("*.bybit.com", 0),
             ("coinbase.com", 0), ("*.coinbase.com", 0),
             # Other
@@ -246,6 +249,7 @@ class RuleEngine:
             ("*.steampowered.com", 0), ("steamcommunity.com", 0),
             ("*.notion.so", 0), ("slack.com", 0), ("*.slack.com", 0),
             ("*.zoom.us", 0), ("*.dropbox.com", 0), ("*.dropboxusercontent.com", 0),
+            ("*.intercom.io", 0), ("*.intercomcdn.com", 0),
         ]
         for pattern, priority in default_proxy_domains:
             self._domain_rules.append(DomainRule(

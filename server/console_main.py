@@ -25,6 +25,7 @@ def generate_self_signed_cert(cert_file: str, key_file: str):
     from cryptography.hazmat.primitives.asymmetric import rsa
     import datetime
 
+    now = datetime.datetime.now(datetime.timezone.utc)
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Furun VPN Server")])
     cert = (
@@ -32,8 +33,8 @@ def generate_self_signed_cert(cert_file: str, key_file: str):
         .subject_name(name).issuer_name(name)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime.utcnow())
-        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=3650))
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=3650))
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
         .sign(key, hashes.SHA256())
     )
