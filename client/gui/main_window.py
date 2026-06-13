@@ -21,7 +21,7 @@ from PyQt6.QtGui import QAction, QIcon, QCloseEvent, QPixmap, QPainter, QColor, 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from common.utils import get_logger, get_data_path
-from client.core.tunnel import TunnelPool, TunnelClient, TunnelConfig, POOL_DEFAULT_SIZE
+from client.core.tunnel import TunnelPool, TunnelConfig, POOL_DEFAULT_SIZE
 from client.core.rule_engine import RuleEngine, Action
 from client.core.router import Router
 from client.core.http_proxy import HttpConnectProxy
@@ -58,7 +58,6 @@ class MainWindow(QMainWindow):
         self.resize(640, 570)
 
         self._running = False
-        self._tunnel: TunnelClient | None = None
         self._pool: TunnelPool | None = None
         self._router: Router | None = None
         self._proxy: HttpConnectProxy | None = None
@@ -322,7 +321,7 @@ class MainWindow(QMainWindow):
             self._router = Router(self._pool, self._rule_engine)
 
             proxy_host = self._config.get("socks5_host", "127.0.0.1")
-            proxy_port = int(self._config.get("socks5_port", 8080))
+            proxy_port = int(self._config.get("socks5_port", 1080))
             self._proxy = HttpConnectProxy(self._router, proxy_host, proxy_port)
 
             await self._proxy.start()
@@ -437,7 +436,7 @@ class MainWindow(QMainWindow):
 
     def _set_system_proxy(self, enable: bool):
         """Enable or disable the Windows system proxy."""
-        http_port = self._config.get("socks5_port", 8080)
+        http_port = self._config.get("socks5_port", 1080)
         try:
             import winreg
             key = winreg.OpenKey(

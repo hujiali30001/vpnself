@@ -18,6 +18,11 @@ from server.forward_proxy import ForwardProxy
 
 log = get_logger("server.tunnel")
 
+# Max bytes buffered per stream while its CONNECT is still pending. Normally
+# this only holds a TLS ClientHello (~few KB); the cap guards against a client
+# flooding DATA frames for a stream whose target never connects.
+MAX_PENDING_BYTES = 256 * 1024
+
 
 class TunnelServer:
     """Accepts encrypted client connections and manages proxy forwarding."""
@@ -200,10 +205,18 @@ class TunnelServer:
                             except (ConnectionError, OSError):
                                 pass
                         elif stream_id in active_streams:
-                            pending_data.setdefault(stream_id, []).append(payload)
-                            log.debug("[S%d] DATA %d bytes BUFFERED (connect still pending, queue: %d)",
-                                     stream_id, len(payload),
-                                     len(pending_data.get(stream_id, [])))
+                            buffered = pending_data.setdefault(stream_id, [])
+                            current = sum(len(d) for d in buffered)
+                            if current + len(payload) > MAX_PENDING_BYTES:
+                                log.warning("[S%d] pending buffer exceeded %d bytes -- "
+                                            "dropping stream (slow/dead CONNECT)",
+                                            stream_id, MAX_PENDING_BYTES)
+                                pending_data.pop(stream_id, None)
+                                deferred_close.add(stream_id)
+                            else:
+                                buffered.append(payload)
+                                log.debug("[S%d] DATA %d bytes BUFFERED (connect still pending, queue: %d)",
+                                         stream_id, len(payload), len(buffered))
                         else:
                             log.warning("[S%d] DATA %d bytes DROPPED (no relay, no pending connect)",
                                         stream_id, len(payload))

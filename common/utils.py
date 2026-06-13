@@ -11,7 +11,6 @@ import sys
 import socket
 import ipaddress
 import os
-from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -20,22 +19,12 @@ from pathlib import Path
 LOG_FORMAT = "%(asctime)s.%(msecs)03d [%(levelname)-5s] %(name)s | %(message)s"
 LOG_DATE_FORMAT = "%m-%d %H:%M:%S"
 
-# Module-level log accessor for the Qt bridge
-_qt_handler: logging.Handler | None = None
-
-
-def get_qt_handler() -> logging.Handler | None:
-    """Return the current Qt log handler, if registered."""
-    return _qt_handler
-
 
 def create_qt_handler(signal) -> logging.Handler:
     """
     Create a logging handler that emits log records via a Qt signal.
     The signal must accept two str args: (message, level).
     """
-    global _qt_handler
-
     class _QtHandler(logging.Handler):
         def emit(self, record: logging.LogRecord):
             try:
@@ -48,7 +37,6 @@ def create_qt_handler(signal) -> logging.Handler:
     handler.setLevel(logging.DEBUG)
     fmt = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
     handler.setFormatter(fmt)
-    _qt_handler = handler
     return handler
 
 
@@ -187,15 +175,3 @@ def ip_in_network(ip_str: str, network_str: str) -> bool:
         return ipaddress.ip_address(ip_str) in ipaddress.ip_network(network_str)
     except ValueError:
         return False
-
-
-def ensure_dir(path: str | Path) -> Path:
-    """Ensure a directory exists and return its Path."""
-    p = Path(path)
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-
-def utc_timestamp() -> str:
-    """Return current UTC timestamp in ISO format."""
-    return datetime.now(timezone.utc).isoformat()

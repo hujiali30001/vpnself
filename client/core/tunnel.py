@@ -50,7 +50,11 @@ class TunnelStream:
                 "bytes_recv": self._bytes_recv, "closed": self._closed}
 
     async def read(self, n: int = -1) -> bytes:
-        """Read data from this stream. Restored to original two-path version."""
+        """Read data from this stream.
+
+        With n < 0, drains all currently-queued chunks (coalescing them) and
+        blocks only if the queue is empty. With n >= 0, returns the next chunk.
+        """
         if self._closed:
             return b""
         try:

@@ -7,6 +7,7 @@ Uses explicit DNS resolution for consistency with system resolver.
 
 import asyncio
 import socket
+import ipaddress
 from common.utils import get_logger
 
 log = get_logger("server.forward")
@@ -183,11 +184,22 @@ class ForwardProxy:
 
     @staticmethod
     def _resolve(host: str) -> str:
-        """Resolve hostname using system DNS (same as ping/curl)."""
+        """Resolve hostname using system DNS (same as ping/curl).
+
+        Rejects targets that resolve to non-public addresses (loopback,
+        private, link-local, reserved). This blocks SSRF: an authenticated
+        client must not be able to make the server reach its own internal
+        network or cloud metadata endpoints (e.g. 169.254.169.254).
+        """
         info = socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)
         if not info:
             raise OSError(f"DNS resolution returned no results for {host}")
-        return info[0][4][0]
+        ip = info[0][4][0]
+        addr = ipaddress.ip_address(ip)
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            raise OSError(f"refusing non-public target {host} -> {ip}")
+        return ip
 
     def remove_relay(self, client_id: int, stream_id: int):
         key = self._make_key(client_id, stream_id)

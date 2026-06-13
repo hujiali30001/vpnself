@@ -99,6 +99,7 @@ class CircuitBreaker:
         self._failures[ip].append(now)
         self._prune()
         self._schedule_save()
+
     def get_blocked_count(self) -> int:
         now = time.time()
         return sum(1 for until in self._blocked.values() if now <= until)
