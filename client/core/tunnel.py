@@ -35,10 +35,17 @@ class TunnelConfig:
 
 
 class TunnelStream:
+    # Max bytes buffered for one stream awaiting the local app to read. Guards
+    # against unbounded memory growth when the local consumer (e.g. a trading
+    # bot) reads slower than the tunnel delivers. On overflow the stream is
+    # closed rather than letting the process grow without limit.
+    MAX_BUFFER_BYTES = 8 * 1024 * 1024
+
     def __init__(self, stream_id: int, tunnel: "TunnelClient"):
         self.stream_id = stream_id
         self._tunnel = tunnel
         self._buffer: asyncio.Queue = asyncio.Queue()
+        self._buffered_bytes = 0
         self._closed = False
         self._connect_future: asyncio.Future | None = None
         self._bytes_recv = 0
@@ -74,6 +81,7 @@ class TunnelStream:
                     if data is None:
                         self._closed = True
                         return b""
+                self._buffered_bytes -= len(data)
                 self._bytes_recv += len(data)
                 return data
             else:
@@ -82,6 +90,7 @@ class TunnelStream:
                 if data is None:
                     self._closed = True
                     return b""
+                self._buffered_bytes -= len(data)
                 self._bytes_recv += len(data)
                 return data[:n]
         except Exception:
@@ -90,6 +99,13 @@ class TunnelStream:
 
     def feed_data(self, data: bytes):
         if not self._closed:
+            if self._buffered_bytes + len(data) > self.MAX_BUFFER_BYTES:
+                log.warning("TUNNEL: [S%d] recv buffer over %d bytes "
+                            "(local app reading too slowly) -- closing stream",
+                            self.stream_id, self.MAX_BUFFER_BYTES)
+                self.close()
+                return
+            self._buffered_bytes += len(data)
             self._buffer.put_nowait(data)
 
     def close(self):
@@ -257,6 +273,12 @@ class TunnelClient:
                         sid, target_host, target_port, timeout)
             self._streams.pop(sid, None)
             stream.close()
+            if writer is not None and self._connected:
+                try:
+                    writer.write(pack_close(sid))
+                    await writer.drain()
+                except (ConnectionError, OSError, AssertionError):
+                    pass
             return None
 
     async def send_data(self, sid: int, data: bytes):
@@ -384,9 +406,9 @@ class TunnelClient:
 
 
 # Connection pool tuning constants
-POOL_DEFAULT_SIZE = 4
+POOL_DEFAULT_SIZE = 128
 POOL_MIN_SIZE = 1
-POOL_MAX_SIZE = 16
+POOL_MAX_SIZE = 128
 POOL_RECONNECT_DELAY = 5.0  # base delay between reconnect attempts (seconds)
 
 # =============================================================================

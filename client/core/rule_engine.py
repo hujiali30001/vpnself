@@ -244,6 +244,7 @@ class RuleEngine:
             ("*.bnbstatic.com", 0),  # Binance static/CDN resources
             ("bybit.com", 0), ("*.bybit.com", 0),
             ("coinbase.com", 0), ("*.coinbase.com", 0),
+            ("okx.com", 0), ("*.okx.com", 0),
             # Other
             ("wikipedia.org", 0), ("*.wikipedia.org", 0),
             ("*.steampowered.com", 0), ("steamcommunity.com", 0),

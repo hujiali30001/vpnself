@@ -12,6 +12,47 @@ from common.utils import get_logger
 
 log = get_logger("server.forward")
 
+# Max seconds to flush a frame into the tunnel before declaring the connection
+# dead. A client socket that stops reading (crashed app, frozen NIC) must not be
+# able to block the shared tunnel write lock indefinitely -- that would stall
+# every other stream's CONNECT_OK/DATA/PONG on the same tunnel.
+DRAIN_TIMEOUT = 15.0
+
+
+async def send_frame_locked(writer: asyncio.StreamWriter,
+                            write_lock: "asyncio.Lock | None",
+                            frame: bytes,
+                            timeout: float = DRAIN_TIMEOUT) -> bool:
+    """Write one frame to the shared tunnel writer under the lock, with a
+    bounded drain.
+
+    Returns True on success, False if the tunnel is dead or stuck. A drain that
+    exceeds ``timeout`` means the peer stopped reading: we close the writer so
+    the server read loop sees EOF and the client pool reconnects, rather than
+    leaving a zombie tunnel that answers PINGs but relays nothing.
+
+    Concurrent ``drain()`` on one StreamWriter is unsafe, so write+drain stay
+    inside the lock; the timeout is what bounds how long the lock is held.
+    """
+    try:
+        if write_lock:
+            async with write_lock:
+                writer.write(frame)
+                await asyncio.wait_for(writer.drain(), timeout=timeout)
+        else:
+            writer.write(frame)
+            await asyncio.wait_for(writer.drain(), timeout=timeout)
+        return True
+    except asyncio.TimeoutError:
+        log.warning("tunnel drain stalled >%.0fs -- closing dead tunnel", timeout)
+        try:
+            writer.close()
+        except Exception:
+            pass
+        return False
+    except (ConnectionError, OSError, AssertionError):
+        return False
+
 
 class ForwardRelay:
     """Bidirectional relay between a tunnel stream and a target TCP connection."""
@@ -38,21 +79,10 @@ class ForwardRelay:
                 if not data:
                     break
                 frame = pack_data_func(self.stream_id, data)
-                if self.write_lock:
-                    async with self.write_lock:
-                        try:
-                            self.tunnel_writer.write(frame)
-                            await self.tunnel_writer.drain()
-                        except (ConnectionError, OSError, AssertionError):
-                            log.debug("Stream %d: tunnel write failed", self.stream_id)
-                            break
-                else:
-                    try:
-                        self.tunnel_writer.write(frame)
-                        await self.tunnel_writer.drain()
-                    except (ConnectionError, OSError, AssertionError):
-                        log.debug("Stream %d: tunnel write failed", self.stream_id)
-                        break
+                if not await send_frame_locked(self.tunnel_writer,
+                                               self.write_lock, frame):
+                    log.debug("Stream %d: tunnel write failed/stalled", self.stream_id)
+                    break
                 bytes_relayed += len(data)
         except (ConnectionError, asyncio.IncompleteReadError, OSError) as e:
             log.debug("Stream %d: relay finished: %d bytes (%s)",
@@ -122,8 +152,8 @@ class ForwardProxy:
         except (asyncio.TimeoutError, OSError) as e:
             log.warning("Stream %d: DNS resolution failed for %s: %s",
                         stream_id, host, e)
-            await self._send_frame(tunnel_writer, write_lock,
-                                   pack_connect_fail_func(stream_id, "DNS resolution failed"))
+            await send_frame_locked(tunnel_writer, write_lock,
+                                    pack_connect_fail_func(stream_id, "DNS resolution failed"))
             return None
         log.info("CONNECT %s:%d -> %s", host, port, ip)
 
@@ -151,36 +181,21 @@ class ForwardProxy:
                 self._active_relays[self._make_key(client_id, stream_id)] = relay
 
                 ok_frame = pack_connect_ok_func(stream_id)
-                await self._send_frame(tunnel_writer, write_lock, ok_frame)
+                await send_frame_locked(tunnel_writer, write_lock, ok_frame)
 
                 return relay
             except asyncio.TimeoutError:
                 log.warning("Stream %d: CONNECT TIMEOUT (DNS/TCP) to %s:%d",
                             stream_id, host, port)
-                await self._send_frame(tunnel_writer, write_lock,
-                                       pack_connect_fail_func(stream_id, "Connection timeout"))
+                await send_frame_locked(tunnel_writer, write_lock,
+                                        pack_connect_fail_func(stream_id, "Connection timeout"))
                 return None
             except (ConnectionError, OSError) as e:
                 log.warning("Stream %d: CONNECT FAILED to %s:%d: %s",
                             stream_id, host, port, e)
-                await self._send_frame(tunnel_writer, write_lock,
-                                       pack_connect_fail_func(stream_id, str(e)))
+                await send_frame_locked(tunnel_writer, write_lock,
+                                        pack_connect_fail_func(stream_id, str(e)))
                 return None
-
-    @staticmethod
-    async def _send_frame(writer: asyncio.StreamWriter,
-                          write_lock: asyncio.Lock | None, frame: bytes):
-        """Write a frame to the shared tunnel writer, guarding with the lock if present."""
-        try:
-            if write_lock:
-                async with write_lock:
-                    writer.write(frame)
-                    await writer.drain()
-            else:
-                writer.write(frame)
-                await writer.drain()
-        except (ConnectionError, OSError, AssertionError):
-            pass
 
     @staticmethod
     def _resolve(host: str) -> str:

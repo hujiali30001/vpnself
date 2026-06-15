@@ -14,7 +14,7 @@ from common.protocol import (
 )
 from common.crypto import create_server_ssl_context
 from common.utils import get_logger
-from server.forward_proxy import ForwardProxy
+from server.forward_proxy import ForwardProxy, send_frame_locked, DRAIN_TIMEOUT
 
 log = get_logger("server.tunnel")
 
@@ -171,10 +171,13 @@ class TunnelServer:
                     if cmd == Cmd.PING:
                         log.debug("[CLIENT %s:%d] Frame #%d: PING (stream %d) -> PONG",
                                   peer[0], peer[1], frame_count, stream_id)
-                        try:
-                            writer.write(pack_pong())
-                            await writer.drain()
-                        except (ConnectionError, OSError, AssertionError):
+                        # PONG goes through the SAME locked + drain-bounded path
+                        # as DATA/CONNECT_OK. This is deliberate: if the data
+                        # plane is wedged (client not reading), PONG must also
+                        # fail to send, so the client's health check sees no
+                        # traffic and reconnects -- instead of a zombie tunnel
+                        # that answers PINGs forever while relaying nothing.
+                        if not await send_frame_locked(writer, write_lock, pack_pong()):
                             break
 
                     elif cmd == Cmd.CONNECT:
@@ -201,7 +204,18 @@ class TunnelServer:
                         if relay:
                             try:
                                 relay.target_writer.write(payload)
-                                await relay.target_writer.drain()
+                                # Bound the drain: a slow/stalled target must not
+                                # block this read loop (head-of-line blocking would
+                                # freeze every other stream + PING on this tunnel).
+                                await asyncio.wait_for(
+                                    relay.target_writer.drain(), timeout=DRAIN_TIMEOUT)
+                            except asyncio.TimeoutError:
+                                log.warning("[S%d] target drain stalled >%.0fs -- dropping stream",
+                                            stream_id, DRAIN_TIMEOUT)
+                                self.forward_proxy.remove_relay(client_id, stream_id)
+                                task = active_streams.pop(stream_id, None)
+                                if task and not task.done():
+                                    task.cancel()
                             except (ConnectionError, OSError):
                                 pass
                         elif stream_id in active_streams:

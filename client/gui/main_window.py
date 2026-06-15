@@ -142,7 +142,7 @@ class MainWindow(QMainWindow):
 
         config_layout.addWidget(QLabel("连接池:"), 3, 0)
         self.pool_size_spin = QSpinBox()
-        self.pool_size_spin.setRange(1, 16)
+        self.pool_size_spin.setRange(1, 128)
         self.pool_size_spin.setValue(int(self._config.get("pool_size", POOL_DEFAULT_SIZE)))
         self.pool_size_spin.setToolTip(u"并行隧道数量，增加可提升多连接吞吐量")
         config_layout.addWidget(self.pool_size_spin, 3, 1)

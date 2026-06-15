@@ -19,7 +19,7 @@ DEFAULT_CONFIG = {
     "auto_set_system_proxy": True,
     "log_level": "INFO",
     "log_file": "",
-    "pool_size": 4,
+    "pool_size": 128,
 }
 
 

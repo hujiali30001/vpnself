@@ -188,15 +188,18 @@ class Router:
                     self._dns_cache[host] = (time.monotonic() + DNS_CACHE_TTL, resolved_ip)
                     self._prune_dns_cache()
 
-        if resolved_ip and is_special_ip(resolved_ip):
-            action = Action.DIRECT
-        else:
-            action = self.rule_engine.evaluate_with_ip(host, resolved_ip)
-            if action == self.rule_engine.default_action and resolved_ip:
-                if is_china_ip(resolved_ip):
-                    action = Action.DIRECT
-                elif self.pool.connected:
-                    action = Action.PROXY
+        # Explicit domain/IP rules take precedence over IP-based heuristics.
+        # A GFW-poisoned DNS answer (e.g. a bogus link-local or China-looking IP)
+        # must not override an explicit PROXY/BLOCK rule for the hostname.
+        action = self.rule_engine.evaluate_with_ip(host, resolved_ip)
+        if action == self.rule_engine.default_action:
+            # No explicit rule matched; fall back to IP-based heuristics.
+            if resolved_ip and is_special_ip(resolved_ip):
+                action = Action.DIRECT
+            elif resolved_ip and is_china_ip(resolved_ip):
+                action = Action.DIRECT
+            elif self.pool.connected:
+                action = Action.PROXY
 
         if action == Action.DIRECT and resolved_ip and self.circuit_breaker.is_blocked(resolved_ip):
             self._stats["cb_blocked"] += 1
