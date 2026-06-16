@@ -303,6 +303,7 @@ class MainWindow(QMainWindow):
                 tls_cert_file=self._config.get("tls_cert_file") or None,
                 verify_cert=self._config.get("verify_cert", False),
                 connect_timeout=float(self._config.get("connect_timeout", 10)),
+                optimistic_connect=bool(self._config.get("optimistic_connect", False)),
             )
 
             pool_size = int(self._config.get("pool_size", POOL_DEFAULT_SIZE))

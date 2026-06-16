@@ -70,6 +70,7 @@ python -m PyInstaller --noconfirm server_console.spec
 | auto_set_system_proxy | true | 自动设置 Windows 系统代理 |
 | pool_size | 128 | 并行隧道数量（1-128） |
 | connect_timeout | 10 | TLS 握手超时（秒） |
+| optimistic_connect | false | 不等 CONNECT_OK 直接发数据（每连接省 ~1 RTT；实验性） |
 | log_level | INFO | 日志级别：DEBUG / INFO |
 
 ### 服务端（server_config.json）
@@ -88,3 +89,6 @@ python -m PyInstaller --noconfirm server_console.spec
 ## 说明 / 已知限制
 
 - **仅 IPv4 出站。** 服务端只通过 IPv4（`AF_INET`）解析并连接目标，纯 IPv6 目标无法访问。
+- **明文 HTTP 连接复用。** 对非加密 HTTP（非 HTTPS/CONNECT），keep-alive 的代理连接会绑定到首个目标主机；同一连接复用去往不同主机的请求不会重新路由。HTTPS（绝大多数流量）不受影响。
+- **TLS 信任。** 默认客户端接受服务端自签证书（`verify_cert=false`），仅靠 PSK 保护。若要防御在途 MITM,请固定证书:把服务端 `server.crt` 拷到客户端,设 `tls_cert_file` 指向它并 `verify_cert=true`。
+- **乐观流水线为实验特性。** `optimistic_connect=true` 每连接省一个往返,但目标不可达会表现为连接被断开而非立即 502。默认关闭,测试满意后再启用。

@@ -20,6 +20,7 @@ DEFAULT_CONFIG = {
     "log_level": "INFO",
     "log_file": "",
     "pool_size": 128,
+    "optimistic_connect": False,
 }
 
 

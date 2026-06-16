@@ -21,6 +21,8 @@ AUTH_ACK = Cmd.CONNECT_OK
 PING_INTERVAL = 30.0
 HEALTH_CHECK_INTERVAL = 10.0  # How often to check connection health
 HEALTH_TIMEOUT = 50.0  # Max time without receiving data before considering dead
+WRITE_DRAIN_TIMEOUT = 15.0  # Max time one frame write may block before the
+                            # tunnel is declared dead (mirrors server side)
 
 
 @dataclass
@@ -32,6 +34,10 @@ class TunnelConfig:
     verify_cert: bool = False
     connect_timeout: float = 10.0
     auto_reconnect: bool = True
+    # Optimistic pipelining: send CONNECT and start relaying app data without
+    # waiting for the server's CONNECT_OK (saves ~1 RTT per connection). The
+    # server buffers pipelined DATA until the target connects. Off by default.
+    optimistic_connect: bool = False
 
 
 class TunnelStream:
@@ -148,6 +154,7 @@ class TunnelClient:
         self._health_task: asyncio.Task | None = None
         self._ping_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()  # serialize all writes to _writer
         self._on_disconnect: list[callable] = []
         self._frame_rx = 0
         self._last_rx_time = 0.0  # monotonic time of last received frame
@@ -243,6 +250,35 @@ class TunnelClient:
                 pass
         log.info("TUNNEL: disconnected (rx=%d frames, tx=%d frames)", self._frame_rx, self._frame_tx)
 
+    async def _send(self, frame: bytes, timeout: float = WRITE_DRAIN_TIMEOUT) -> bool:
+        """Write one frame to the tunnel under the write lock with a bounded drain.
+
+        All writes go through here. Concurrent ``drain()`` on a single
+        StreamWriter is unsafe -- it raises AssertionError and silently drops
+        flow-control backpressure -- so write+drain stay inside the lock. A
+        drain exceeding ``timeout`` means the peer stopped reading: close the
+        writer so the read loop sees EOF and the pool reconnects, instead of
+        buffering unboundedly into a wedged tunnel.
+        """
+        writer = self._writer
+        if writer is None:
+            return False
+        try:
+            async with self._write_lock:
+                writer.write(frame)
+                await asyncio.wait_for(writer.drain(), timeout=timeout)
+            self._frame_tx += 1
+            return True
+        except asyncio.TimeoutError:
+            log.warning("TUNNEL: write drain stalled >%.0fs -- closing dead tunnel", timeout)
+            try:
+                writer.close()
+            except Exception:
+                pass
+            return False
+        except (ConnectionError, OSError, AssertionError):
+            return False
+
     async def create_stream(self, target_host: str, target_port: int,
                             timeout: float = 8.0) -> TunnelStream | None:
         if not self.connected:
@@ -251,12 +287,10 @@ class TunnelClient:
         if self._writer is None:
             log.warning("TUNNEL: cannot create stream -- writer is None")
             return None
-        writer = None
         async with self._lock:
             if not self._connected or self._writer is None:
                 log.warning("TUNNEL: cannot create stream -- tunnel disconnected")
                 return None
-            writer = self._writer
             sid = self._next_stream_id
             self._next_stream_id += 1
             if self._next_stream_id >= 2**32 - 1:
@@ -265,15 +299,19 @@ class TunnelClient:
             self._streams[sid] = stream
 
         log.debug("TUNNEL: [S%d] opening -> %s:%d", sid, target_host, target_port)
-        connect_frame = pack_connect(sid, target_host, target_port)
-        try:
-            writer.write(connect_frame)
-            await writer.drain()
-            self._frame_tx += 1
-        except (ConnectionError, OSError, AssertionError) as e:
-            log.warning("TUNNEL: [S%d] CONNECT send failed (%s), pool will retry", sid, e or "writer closed")
+        if not await self._send(pack_connect(sid, target_host, target_port)):
+            log.warning("TUNNEL: [S%d] CONNECT send failed, pool will retry", sid)
             self._streams.pop(sid, None)
             return None
+
+        if self.config.optimistic_connect:
+            # Don't wait for CONNECT_OK: return now so the caller can pipeline
+            # data immediately (server buffers it until the target connects).
+            # A later CONNECT_FAIL closes the stream (handled in _read_loop).
+            stream._connect_future = None
+            log.debug("TUNNEL: [S%d] CONNECT sent (optimistic, %d active streams)",
+                      sid, len(self._streams))
+            return stream
 
         stream._connect_future = asyncio.Future()
         try:
@@ -289,29 +327,17 @@ class TunnelClient:
                         sid, target_host, target_port, timeout)
             self._streams.pop(sid, None)
             stream.close()
-            if writer is not None and self._connected:
-                try:
-                    writer.write(pack_close(sid))
-                    await writer.drain()
-                except (ConnectionError, OSError, AssertionError):
-                    pass
+            await self._send(pack_close(sid))
             return None
 
     async def send_data(self, sid: int, data: bytes):
-        writer = self._writer
-        if not self.connected or writer is None:
+        if not self.connected:
             return
         stream = self._streams.get(sid)
         if not stream or stream.closed:
             return
         stream._bytes_sent += len(data)
-        frame = pack_frame(sid, Cmd.DATA, data)
-        try:
-            writer.write(frame)
-            await writer.drain()
-            self._frame_tx += 1
-        except (ConnectionError, OSError, AssertionError):
-            pass
+        await self._send(pack_frame(sid, Cmd.DATA, data))
 
     async def close_stream(self, sid: int):
         stream = self._streams.pop(sid, None)
@@ -319,13 +345,8 @@ class TunnelClient:
             stream.close()
             log.debug("TUNNEL: [S%d] CLOSE (sent=%d recv=%d)",
                      sid, stream._bytes_sent, stream._bytes_recv)
-            writer = self._writer
-            if self.connected and writer is not None:
-                try:
-                    writer.write(pack_close(sid))
-                    await writer.drain()
-                except (ConnectionError, OSError):
-                    pass
+            if self.connected:
+                await self._send(pack_close(sid))
 
     async def _read_loop(self):
         buf = b""
@@ -352,12 +373,15 @@ class TunnelClient:
 
                     if cmd in (Cmd.CONNECT_OK, Cmd.CONNECT_FAIL):
                         stream = self._streams.get(sid)
-                        if stream and stream._connect_future:
+                        if stream:
                             if cmd == Cmd.CONNECT_FAIL:
                                 reason = payload.decode("utf-8", errors="replace")
                                 log.warning("TUNNEL: [S%d] CONNECT FAIL from server: %s", sid, reason)
                                 stream.close()
-                            stream._connect_future.set_result(None)
+                            # In blocking mode unblock create_stream; in optimistic
+                            # mode there is no future and the close above suffices.
+                            if stream._connect_future is not None and not stream._connect_future.done():
+                                stream._connect_future.set_result(None)
                     elif cmd == Cmd.DATA:
                         stream = self._streams.get(sid)
                         if stream:
@@ -367,13 +391,7 @@ class TunnelClient:
                         if stream:
                             stream.close()
                     elif cmd == Cmd.PING:
-                        writer = self._writer
-                        if writer:
-                            try:
-                                writer.write(pack_pong())
-                                await writer.drain()
-                            except (ConnectionError, OSError):
-                                pass
+                        await self._send(pack_pong())
                     elif cmd == Cmd.PONG:
                         pass
         except (ConnectionError, asyncio.IncompleteReadError, OSError) as e:
@@ -411,12 +429,8 @@ class TunnelClient:
         try:
             while self._running:
                 await asyncio.sleep(PING_INTERVAL)
-                if self._connected and self._writer:
-                    try:
-                        self._writer.write(pack_ping())
-                        await self._writer.drain()
-                    except (ConnectionError, OSError, AssertionError):
-                        pass
+                if self._connected:
+                    await self._send(pack_ping())
         except asyncio.CancelledError:
             pass
 

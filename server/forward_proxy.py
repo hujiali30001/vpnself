@@ -7,6 +7,7 @@ Uses explicit DNS resolution for consistency with system resolver.
 
 import asyncio
 import socket
+import time
 import ipaddress
 from common.utils import get_logger
 
@@ -17,6 +18,12 @@ log = get_logger("server.forward")
 # able to block the shared tunnel write lock indefinitely -- that would stall
 # every other stream's CONNECT_OK/DATA/PONG on the same tunnel.
 DRAIN_TIMEOUT = 15.0
+
+# Server-side DNS cache. Resolution is the project's core value (DNS runs in
+# Japan), but a hot domain is otherwise re-resolved on every CONNECT across all
+# tunnels. Cache validated public IPs briefly to cut load on the system resolver.
+SERVER_DNS_TTL = 300.0       # seconds a resolved host stays cached
+SERVER_DNS_CACHE_MAX = 2048  # cap entries to bound memory
 
 
 async def send_frame_locked(writer: asyncio.StreamWriter,
@@ -111,6 +118,28 @@ class ForwardProxy:
         self._semaphore = asyncio.Semaphore(max_connections)
         self._active_relays: dict[int, ForwardRelay] = {}  # key: composite_id = (client_id << 32) | stream_id
         self._total_connections = 0
+        self._dns_cache: dict[str, tuple[float, str]] = {}  # host -> (expiry_monotonic, ip)
+
+    def _dns_cache_get(self, host: str) -> str | None:
+        entry = self._dns_cache.get(host)
+        if entry is None:
+            return None
+        if time.monotonic() < entry[0]:
+            return entry[1]
+        del self._dns_cache[host]
+        return None
+
+    def _dns_cache_put(self, host: str, ip: str):
+        now = time.monotonic()
+        if len(self._dns_cache) >= SERVER_DNS_CACHE_MAX:
+            # Drop expired entries first; if still full, evict soonest-to-expire.
+            for h in [h for h, (exp, _) in self._dns_cache.items() if now >= exp]:
+                del self._dns_cache[h]
+            if len(self._dns_cache) >= SERVER_DNS_CACHE_MAX:
+                overflow = len(self._dns_cache) - SERVER_DNS_CACHE_MAX + 1
+                for h, _ in sorted(self._dns_cache.items(), key=lambda kv: kv[1][0])[:overflow]:
+                    del self._dns_cache[h]
+        self._dns_cache[host] = (now + SERVER_DNS_TTL, ip)
 
     @staticmethod
     def _make_key(client_id: int, stream_id: int) -> int:
@@ -142,19 +171,23 @@ class ForwardProxy:
         """Establish a connection to target and return a relay, or None on failure."""
         # Resolve DNS outside the semaphore to avoid blocking other connections.
         # A DNS failure must still send CONNECT_FAIL, otherwise the client stream
-        # hangs until its own timeout instead of fast-failing.
-        loop = asyncio.get_running_loop()
-        try:
-            ip = await asyncio.wait_for(
-                loop.run_in_executor(None, self._resolve, host),
-                timeout=self.DNS_TIMEOUT,
-            )
-        except (asyncio.TimeoutError, OSError) as e:
-            log.warning("Stream %d: DNS resolution failed for %s: %s",
-                        stream_id, host, e)
-            await send_frame_locked(tunnel_writer, write_lock,
-                                    pack_connect_fail_func(stream_id, "DNS resolution failed"))
-            return None
+        # hangs until its own timeout instead of fast-failing. Cache hits skip
+        # the resolver entirely (only validated public IPs are ever cached).
+        ip = self._dns_cache_get(host)
+        if ip is None:
+            loop = asyncio.get_running_loop()
+            try:
+                ip = await asyncio.wait_for(
+                    loop.run_in_executor(None, self._resolve, host),
+                    timeout=self.DNS_TIMEOUT,
+                )
+            except (asyncio.TimeoutError, OSError) as e:
+                log.warning("Stream %d: DNS resolution failed for %s: %s",
+                            stream_id, host, e)
+                await send_frame_locked(tunnel_writer, write_lock,
+                                        pack_connect_fail_func(stream_id, "DNS resolution failed"))
+                return None
+            self._dns_cache_put(host, ip)
         log.info("CONNECT %s:%d -> %s", host, port, ip)
 
         async with self._semaphore:
@@ -178,10 +211,15 @@ class ForwardProxy:
                 relay = ForwardRelay(stream_id, tunnel_writer,
                                      target_reader, target_writer,
                                      write_lock=write_lock)
-                self._active_relays[self._make_key(client_id, stream_id)] = relay
 
                 ok_frame = pack_connect_ok_func(stream_id)
                 await send_frame_locked(tunnel_writer, write_lock, ok_frame)
+
+                # Register the relay only AFTER CONNECT_OK is on the wire. Any
+                # DATA the client pipelines before this point stays in the
+                # caller's pending buffer (flushed in order by _handle_connect),
+                # instead of racing ahead of earlier bytes via get_relay().
+                self._active_relays[self._make_key(client_id, stream_id)] = relay
 
                 return relay
             except asyncio.TimeoutError:

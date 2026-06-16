@@ -70,6 +70,7 @@ python -m PyInstaller --noconfirm server_console.spec
 | auto_set_system_proxy | true | Auto-set Windows system proxy |
 | pool_size | 128 | Parallel tunnel connections (1-128) |
 | connect_timeout | 10 | TLS handshake timeout (seconds) |
+| optimistic_connect | false | Pipeline data without waiting for CONNECT_OK (saves ~1 RTT/conn; experimental) |
 | log_level | INFO | Log level: DEBUG / INFO |
 
 ### Server (server_config.json)
@@ -88,3 +89,6 @@ python -m PyInstaller --noconfirm server_console.spec
 ## Notes / Limitations
 
 - **IPv4-only egress.** The server resolves and connects to targets over IPv4 (`AF_INET`) only; IPv6-only destinations are not reachable.
+- **Plain-HTTP connection reuse.** For unencrypted HTTP (not HTTPS/CONNECT), a keep-alive proxy connection is pinned to its first target host; a reused connection to a different host is not re-routed. HTTPS — the vast majority of traffic — is unaffected.
+- **TLS trust.** By default the client accepts the server's self-signed certificate (`verify_cert=false`) and relies on the PSK. For protection against an in-path MITM, pin the certificate: copy the server's `server.crt` to the client, set `tls_cert_file` to it and `verify_cert=true`.
+- **Optimistic pipelining is experimental.** `optimistic_connect=true` removes one round-trip per connection but reports target-unreachable as a dropped connection instead of an immediate 502. Off by default; enable after testing your link.
