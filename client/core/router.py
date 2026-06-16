@@ -102,6 +102,13 @@ class _TunnelStreamReader(asyncio.StreamReader):
 DNS_CACHE_TTL = 300
 DNS_CACHE_MAX = 1024
 
+# Heuristic thresholds for the circuit breaker's auto-learning of dead direct
+# routes. A real TLS session sends a ClientHello (>~200 B up) and gets a
+# ServerHello back (>~7 B down); a GFW reset or silent drop leaves near-zero
+# bytes in at least one direction. Tuned to avoid false positives on CDNs.
+TLS_OK_MIN_SENT = 200
+TLS_OK_MIN_RECV = 7
+
 
 class Router:
     """Orchestrates traffic routing between direct and proxy paths."""
@@ -124,6 +131,7 @@ class Router:
         s = dict(self._stats)
         s["cb_blocked"] = self.circuit_breaker.get_blocked_count()
         s["cb_tracked"] = self.circuit_breaker.get_failure_count()
+        s["cb_tls_rejects"] = self.circuit_breaker.get_tls_reject_count()
         return s
 
     async def record_stream_result(self, host: str, bytes_sent: int, bytes_recv: int):
@@ -132,16 +140,21 @@ class Router:
         if is_ip_address(host):
             resolved_ip = host
         else:
-            try:
-                resolved_ip = await asyncio.get_running_loop().run_in_executor(
-                    None, resolve_host, host)
-            except Exception:
-                return
+            # Reuse the DNS answer route() just cached; only fall back to a
+            # fresh lookup on a miss, so we don't pay a second resolve per
+            # completed stream.
+            resolved_ip = self._cached_resolve(host)
+            if resolved_ip is None:
+                try:
+                    resolved_ip = await asyncio.get_running_loop().run_in_executor(
+                        None, resolve_host, host)
+                except Exception:
+                    return
         if not resolved_ip or not is_ip_address(resolved_ip):
             return
-        if bytes_sent > 200 or bytes_recv > 7:
+        if bytes_sent > TLS_OK_MIN_SENT or bytes_recv > TLS_OK_MIN_RECV:
             self.circuit_breaker.record_success(resolved_ip)
-        elif bytes_sent <= 200 and bytes_recv <= 7:
+        else:
             self.circuit_breaker.record_tls_reject(resolved_ip)
 
     def _cached_resolve(self, host: str) -> str | None:

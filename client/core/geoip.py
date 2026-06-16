@@ -6,6 +6,7 @@ Uses a built-in China IP list as the primary source.
 """
 
 from pathlib import Path
+import bisect
 import ipaddress
 
 from common.utils import get_logger
@@ -77,63 +78,86 @@ SPECIAL_IP_RANGES = [
 ]
 
 
-# Pre-compute network objects for fast lookup
-_CHINA_NETWORKS = tuple(ipaddress.ip_network(r) for r in CHINA_IP_RANGES)
-_SPECIAL_NETWORKS = tuple(ipaddress.ip_network(r) for r in SPECIAL_IP_RANGES)
+class _IntervalSet:
+    """Sorted, merged integer intervals for O(log n) IPv4 membership tests.
+
+    CIDRs are collapsed into disjoint [start, end] ranges, so a single bisect
+    locates the only interval that could contain an address -- replacing the
+    previous O(n) scan over every network on each lookup.
+    """
+
+    def __init__(self, cidrs):
+        self._starts: list[int] = []
+        self._ends: list[int] = []
+        self.rebuild(cidrs)
+
+    def rebuild(self, cidrs):
+        intervals = []
+        for c in cidrs:
+            net = ipaddress.ip_network(c, strict=False)
+            intervals.append((int(net.network_address), int(net.broadcast_address)))
+        intervals.sort()
+        starts: list[int] = []
+        ends: list[int] = []
+        for s, e in intervals:
+            if ends and s <= ends[-1] + 1:  # overlapping or adjacent -> merge
+                if e > ends[-1]:
+                    ends[-1] = e
+            else:
+                starts.append(s)
+                ends.append(e)
+        self._starts, self._ends = starts, ends
+
+    def contains(self, ip_str: str) -> bool:
+        try:
+            ip = int(ipaddress.ip_address(ip_str))
+        except ValueError:
+            return False
+        i = bisect.bisect_right(self._starts, ip) - 1
+        return i >= 0 and ip <= self._ends[i]
+
+
+# Pre-compute merged interval sets for fast lookup
+_CHINA_SET = _IntervalSet(CHINA_IP_RANGES)
+_SPECIAL_SET = _IntervalSet(SPECIAL_IP_RANGES)
+
 
 def is_china_ip(ip_str: str) -> bool:
     """Check if an IPv4 address is allocated to China.
     Caller should check is_special_ip() first for special-use addresses.
     """
-    try:
-        addr = ipaddress.ip_address(ip_str)
-    except ValueError:
-        return False
-    for net in _CHINA_NETWORKS:
-        if addr in net:
-            return True
-    return False
+    return _CHINA_SET.contains(ip_str)
 
 
 def is_special_ip(ip_str: str) -> bool:
     """Check if an IP is in a special-use range."""
-    try:
-        addr = ipaddress.ip_address(ip_str)
-    except ValueError:
-        return False
-    for net in _SPECIAL_NETWORKS:
-        if addr in net:
-            return True
-    return False
+    return _SPECIAL_SET.contains(ip_str)
 
 
 def load_china_ip_list(file_path: str) -> int:
     """Load additional China IP ranges from a text file. Returns count added.
 
-    Updates both the source range list and the precomputed network tuple so
-    the new ranges take effect immediately for is_china_ip() lookups.
+    Updates the source range list and rebuilds the lookup set so the new
+    ranges take effect immediately for is_china_ip().
     """
-    global _CHINA_NETWORKS
     try:
         p = Path(file_path)
         if not p.exists():
             return 0
         with open(p, "r", encoding="utf-8-sig") as f:
             count = 0
-            added_networks = []
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#"):
                     try:
-                        net = ipaddress.ip_network(line, strict=False)
+                        ipaddress.ip_network(line, strict=False)
                     except ValueError:
                         log.warning("Skipping invalid CIDR in %s: %s", file_path, line)
                         continue
                     CHINA_IP_RANGES.append(line)
-                    added_networks.append(net)
                     count += 1
             if count > 0:
-                _CHINA_NETWORKS = _CHINA_NETWORKS + tuple(added_networks)
+                _CHINA_SET.rebuild(CHINA_IP_RANGES)
                 log.info("Loaded %d additional China IP ranges from %s", count, file_path)
             return count
     except OSError as e:
