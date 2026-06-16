@@ -201,6 +201,9 @@ class ForwardProxy:
     def _resolve(host: str) -> str:
         """Resolve hostname using system DNS (same as ping/curl).
 
+        IPv4-only (AF_INET) by design: egress is over IPv4, so IPv6-only
+        targets are not reachable.
+
         Rejects targets that resolve to non-public addresses (loopback,
         private, link-local, reserved). This blocks SSRF: an authenticated
         client must not be able to make the server reach its own internal

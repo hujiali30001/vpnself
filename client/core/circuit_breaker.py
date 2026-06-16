@@ -38,6 +38,8 @@ class CircuitBreaker:
         self._failures: dict[str, list[float]] = defaultdict(list)
         # blocked_until: {ip: float (absolute time when unblocked)}
         self._blocked: dict[str, float] = {}
+        # Running tally of inconclusive TLS results -- stat only, never blocks.
+        self._tls_reject_total = 0
 
         if state_path is None:
             if getattr(sys, "frozen", False):
@@ -93,12 +95,15 @@ class CircuitBreaker:
         log.debug("CB: %s cleared (successful connection)", ip)
 
     def record_tls_reject(self, ip: str):
-        """Record a TLS rejection. Log only -- CDN shared IPs cause too many false positives."""
-        now = time.time()
-        log.info("CB: %s TLS-reject detected (not blocking)", ip)
-        self._failures[ip].append(now)
-        self._prune()
-        self._schedule_save()
+        """Record an inconclusive TLS result for stats only.
+
+        Deliberately does NOT block or feed the failure counter: CDN shared
+        IPs cause too many false positives, so a 'reject' here just means the
+        success heuristic was inconclusive. Tracked as a separate tally so the
+        real connect-failure stats stay clean.
+        """
+        self._tls_reject_total += 1
+        log.info("CB: %s TLS-reject detected (stat only, not blocking)", ip)
 
     def get_blocked_count(self) -> int:
         now = time.time()
@@ -106,6 +111,9 @@ class CircuitBreaker:
 
     def get_failure_count(self) -> int:
         return sum(len(v) for v in self._failures.values())
+
+    def get_tls_reject_count(self) -> int:
+        return self._tls_reject_total
 
     def _prune(self):
         """Remove oldest IPs by count (per-IP, not per-timestamp)."""

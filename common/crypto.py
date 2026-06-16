@@ -1,7 +1,9 @@
 ﻿"""
-Furun VPN - Cryptographic Utilities
+Furun VPN - TLS context helpers.
 
-Key generation, TLS context creation, and pre-shared key (PSK) management.
+Builds the client and server SSL contexts (TLS 1.2+) for the tunnel.
+Tunnel authentication is handled separately via the pre-shared key (PSK)
+exchanged in the AUTH frame, not here.
 """
 
 import ssl

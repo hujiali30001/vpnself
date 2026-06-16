@@ -68,7 +68,7 @@ python -m PyInstaller --noconfirm server_console.spec
 | verify_cert | false | Verify server TLS certificate |
 | auto_connect | false | Auto-connect on startup |
 | auto_set_system_proxy | true | Auto-set Windows system proxy |
-| pool_size | 4 | Parallel tunnel connections (1-16) |
+| pool_size | 128 | Parallel tunnel connections (1-128) |
 | connect_timeout | 10 | TLS handshake timeout (seconds) |
 | log_level | INFO | Log level: DEBUG / INFO |
 
@@ -81,6 +81,10 @@ python -m PyInstaller --noconfirm server_console.spec
 | psk | (required) | Pre-shared key |
 | tls_cert_file | server.crt | TLS certificate path |
 | tls_key_file | server.key | TLS private key path |
-| max_connections | 500 | Max concurrent outbound connections |
+| max_connections | 200 | Max concurrent outbound connections |
 | idle_timeout | 120 | Client idle timeout (seconds) |
 | log_level | INFO | Log level |
+
+## Notes / Limitations
+
+- **IPv4-only egress.** The server resolves and connects to targets over IPv4 (`AF_INET`) only; IPv6-only destinations are not reachable.

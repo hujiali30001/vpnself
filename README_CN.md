@@ -68,7 +68,7 @@ python -m PyInstaller --noconfirm server_console.spec
 | verify_cert | false | 是否验证服务端 TLS 证书 |
 | auto_connect | false | 启动时自动连接 |
 | auto_set_system_proxy | true | 自动设置 Windows 系统代理 |
-| pool_size | 4 | 并行隧道数量（1-16） |
+| pool_size | 128 | 并行隧道数量（1-128） |
 | connect_timeout | 10 | TLS 握手超时（秒） |
 | log_level | INFO | 日志级别：DEBUG / INFO |
 
@@ -81,6 +81,10 @@ python -m PyInstaller --noconfirm server_console.spec
 | psk | （必填） | 预共享密钥 |
 | tls_cert_file | server.crt | TLS 证书路径 |
 | tls_key_file | server.key | TLS 私钥路径 |
-| max_connections | 500 | 最大并发出站连接数 |
+| max_connections | 200 | 最大并发出站连接数 |
 | idle_timeout | 120 | 客户端空闲超时（秒） |
 | log_level | INFO | 日志级别 |
+
+## 说明 / 已知限制
+
+- **仅 IPv4 出站。** 服务端只通过 IPv4（`AF_INET`）解析并连接目标，纯 IPv6 目标无法访问。

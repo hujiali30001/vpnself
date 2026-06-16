@@ -157,7 +157,10 @@ def is_ip_address(host: str) -> bool:
 
 
 def resolve_host(host: str, port: int = 80) -> str:
-    """Resolve a hostname to an IP address. Returns host unchanged if it is already an IP."""
+    """Resolve a hostname to an IPv4 address (AF_INET only).
+
+    Returns host unchanged if it is already an IP or if resolution fails.
+    """
     if is_ip_address(host):
         return host
     try:
