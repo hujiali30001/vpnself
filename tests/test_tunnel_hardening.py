@@ -147,6 +147,36 @@ async def test_client_send_releases_lock_after_timeout():
     assert not c._write_lock.locked()
 
 
+# --- Fan-out fix: server reject stops fan-out, router negative-caches the host -
+
+@pytest.mark.asyncio
+async def test_router_caches_server_reject_and_fast_fails():
+    """A server-side CONNECT reject must be cached so a repeated request
+    fast-fails without re-probing the pool (the 6.ipchaxun.net storm fix)."""
+    from client.core.router import Router
+    from client.core.tunnel import CONNECT_REJECTED
+    from client.core.rule_engine import RuleEngine, Action
+
+    class _FakePool:
+        connected = True
+        def __init__(self):
+            self.calls = 0
+        async def create_stream(self, host, port, timeout=8.0):
+            self.calls += 1
+            return CONNECT_REJECTED
+
+    engine = RuleEngine()
+    engine.default_action = Action.PROXY
+    pool = _FakePool()
+    router = Router(pool, engine)
+
+    assert await router.route("192.0.2.1", 443) is None   # IP host -> no DNS
+    first = pool.calls
+    assert first == 1, "server reject must stop after one tunnel, not fan out"
+    assert await router.route("192.0.2.1", 443) is None   # cached -> fast-fail
+    assert pool.calls == first, "cached unreachable host must not re-probe the pool"
+
+
 # --- Fix B: server-side DNS cache ----------------------------------------------
 
 def test_server_dns_cache_hit_and_expiry():

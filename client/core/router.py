@@ -10,7 +10,7 @@ import asyncio
 import time
 
 from common.utils import get_logger, resolve_host, is_ip_address
-from client.core.tunnel import TunnelPool, TunnelClient, TunnelStream
+from client.core.tunnel import TunnelPool, TunnelClient, TunnelStream, CONNECT_REJECTED
 from client.core.rule_engine import RuleEngine, Action
 from client.core.geoip import is_china_ip, is_special_ip
 from client.core.circuit_breaker import CircuitBreaker
@@ -109,6 +109,12 @@ DNS_CACHE_MAX = 1024
 TLS_OK_MIN_SENT = 200
 TLS_OK_MIN_RECV = 7
 
+# How long a proxy host the server reported unreachable is fast-failed locally,
+# so a page polling a dead host (NXDOMAIN / refused) doesn't re-probe the tunnel
+# on every request. Short enough that a recovering target self-heals quickly.
+PROXY_FAIL_TTL = 15.0
+PROXY_FAIL_MAX = 512
+
 
 class Router:
     """Orchestrates traffic routing between direct and proxy paths."""
@@ -118,6 +124,7 @@ class Router:
         self.rule_engine = rule_engine
         self.circuit_breaker = CircuitBreaker()
         self._dns_cache: dict[str, tuple[float, str]] = {}
+        self._proxy_fail: dict[str, float] = {}  # host -> expiry_monotonic (server-unreachable)
         self._stats = {
             "direct_connections": 0,
             "proxy_connections": 0,
@@ -248,26 +255,53 @@ class Router:
 
         elif action == Action.PROXY:
             self._stats["proxy_connections"] += 1
-            log.debug("PROXY  %s:%d", host, port)
             if not self.pool.connected:
                 log.warning("PROXY: tunnel pool not connected for %s:%d", host, port)
                 self._stats["failed_connections"] += 1
                 return None
 
-            try:
+            # Fast-fail hosts the server recently reported unreachable, so a page
+            # polling a dead host doesn't re-probe the tunnel on every request.
+            now = time.monotonic()
+            exp = self._proxy_fail.get(host)
+            if exp is not None and now < exp:
+                self._stats["failed_connections"] += 1
+                log.debug("PROXY  %s:%d fast-fail (server reported unreachable)", host, port)
+                return None
+
+            log.debug("PROXY  %s:%d", host, port)
+            stream = await self.pool.create_stream(host, port, timeout=10.0)
+            if stream is None:  # no connected tunnel could carry it -- one retry
+                await asyncio.sleep(0.3)
                 stream = await self.pool.create_stream(host, port, timeout=10.0)
-                if stream is None:
-                    await asyncio.sleep(0.3)
-                    stream = await self.pool.create_stream(host, port, timeout=10.0)
-                if stream is None:
-                    self._stats["failed_connections"] += 1
-                    return None
-            except Exception:
-                raise
+
+            if stream is CONNECT_REJECTED:
+                # Host-level failure: every tunnel rejects this target the same
+                # way. Cache it so repeated requests fast-fail above.
+                self._proxy_fail[host] = now + PROXY_FAIL_TTL
+                self._prune_proxy_fail()
+                self._stats["failed_connections"] += 1
+                return None
+            if stream is None:
+                self._stats["failed_connections"] += 1
+                return None
 
             return self._wrap_tunnel_stream(stream)
 
         return None
+
+    def _prune_proxy_fail(self):
+        """Drop expired entries; if still over capacity, evict soonest-to-expire."""
+        if len(self._proxy_fail) <= PROXY_FAIL_MAX:
+            return
+        now = time.monotonic()
+        for h in [h for h, exp in self._proxy_fail.items() if now >= exp]:
+            del self._proxy_fail[h]
+        if len(self._proxy_fail) <= PROXY_FAIL_MAX:
+            return
+        overflow = len(self._proxy_fail) - PROXY_FAIL_MAX
+        for h, _ in sorted(self._proxy_fail.items(), key=lambda kv: kv[1])[:overflow]:
+            del self._proxy_fail[h]
 
     def _wrap_tunnel_stream(self, stream: TunnelStream) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         return _TunnelStreamReader(stream), _TunnelStreamWriter(stream)

@@ -24,6 +24,14 @@ HEALTH_TIMEOUT = 50.0  # Max time without receiving data before considering dead
 WRITE_DRAIN_TIMEOUT = 15.0  # Max time one frame write may block before the
                             # tunnel is declared dead (mirrors server side)
 
+# Sentinel distinguishing a SERVER-side target rejection (CONNECT_FAIL: DNS or
+# connect failure) from a tunnel-level miss. A rejection is host-specific --
+# every tunnel resolves and connects the same target identically -- so the pool
+# must NOT fan the same doomed CONNECT out across all tunnels. create_stream
+# returns this instead of None on rejection; None still means "this tunnel
+# couldn't carry it, try another".
+CONNECT_REJECTED = object()
+
 
 @dataclass
 class TunnelConfig:
@@ -318,8 +326,8 @@ class TunnelClient:
             await asyncio.wait_for(stream._connect_future, timeout=timeout)
             if stream.closed:
                 self._streams.pop(sid, None)
-                log.warning("TUNNEL: [S%d] CONNECT rejected by server", sid)
-                return None
+                log.warning("TUNNEL: [S%d] CONNECT rejected by server (target unreachable)", sid)
+                return CONNECT_REJECTED
             log.debug("TUNNEL: [S%d] CONNECT OK (%d active streams)", sid, len(self._streams))
             return stream
         except asyncio.TimeoutError:
@@ -543,8 +551,13 @@ class TunnelPool:
         log.info("POOL: all tunnels disconnected")
 
     async def create_stream(self, target_host: str, target_port: int,
-                            timeout: float = 8.0) -> TunnelStream | None:
-        """Create a stream on the next connected tunnel (round-robin)."""
+                            timeout: float = 8.0):
+        """Create a stream on the next connected tunnel (round-robin).
+
+        Returns a TunnelStream on success, CONNECT_REJECTED if the server
+        rejected the target (don't retry -- every tunnel fails identically),
+        or None if no connected tunnel could carry the stream.
+        """
         if not self._tunnels:
             return None
 
@@ -559,12 +572,16 @@ class TunnelPool:
             if not t.connected:
                 continue
             stream = await t.create_stream(target_host, target_port, timeout=timeout)
+            if stream is CONNECT_REJECTED:
+                # Host-level failure: stop fanning out -- all tunnels would
+                # reject this target the same way. Avoids a 128x CONNECT storm.
+                return CONNECT_REJECTED
             if stream is not None:
                 return stream
             log.debug("POOL: tunnel[%d] refused stream for %s:%d, trying next",
                      idx, target_host, target_port)
 
-        log.warning("POOL: no connected tunnel available for %s:%d",
+        log.warning("POOL: no tunnel could carry %s:%d (all disconnected or send-failed)",
                    target_host, target_port)
         return None
 
