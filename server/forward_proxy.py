@@ -188,7 +188,9 @@ class ForwardProxy:
                                         pack_connect_fail_func(stream_id, "DNS resolution failed"))
                 return None
             self._dns_cache_put(host, ip)
-        log.info("CONNECT %s:%d -> %s", host, port, ip)
+        # Pre-attempt trace at DEBUG; the INFO line below records the outcome
+        # (host, resolved IP, relay #) in one line to avoid double-logging.
+        log.debug("CONNECT %s:%d -> %s", host, port, ip)
 
         async with self._semaphore:
             try:
@@ -197,8 +199,8 @@ class ForwardProxy:
                     timeout=self.CONNECT_TIMEOUT,
                 )
                 self._total_connections += 1
-                log.info("Stream %d: CONNECT OK %s:%d [relay #%d]",
-                         stream_id, host, port, self._total_connections)
+                log.info("Stream %d: CONNECT OK %s:%d (%s) [relay #%d]",
+                         stream_id, host, port, ip, self._total_connections)
 
                 # TCP_NODELAY for low latency
                 sock = target_writer.get_extra_info("socket")

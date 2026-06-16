@@ -207,7 +207,9 @@ class TunnelClient:
                 response = await asyncio.wait_for(self._reader.read(256), timeout=10.0)
                 result = unpack_frame(response)
                 if result is None or result[1] != AUTH_ACK:
-                    log.error("TUNNEL: AUTH FAILED")
+                    # Per-tunnel; the pool aggregates and the GUI surfaces the
+                    # user-facing error when the whole connection fails.
+                    log.warning("TUNNEL: AUTH FAILED (check PSK)")
                     self._writer.close()
                     return False
                 self._authenticated = True
@@ -222,13 +224,15 @@ class TunnelClient:
                 self._ping_task = asyncio.create_task(self._ping_loop())
                 return True
             except asyncio.TimeoutError:
-                log.error("TUNNEL: connection timeout (%.1fs)", self.config.connect_timeout)
+                # One tunnel among the pool; non-fatal and auto-retried, so this
+                # is a warning, not an error (the pool/GUI report real severity).
+                log.warning("TUNNEL: connection timeout (%.1fs)", self.config.connect_timeout)
                 return False
             except (ConnectionError, OSError) as e:
-                log.error("TUNNEL: connection failed: %s", e)
+                log.warning("TUNNEL: connection failed: %s", e)
                 return False
             except ssl.SSLError as e:
-                log.error("TUNNEL: TLS handshake failed: %s", e)
+                log.warning("TUNNEL: TLS handshake failed: %s", e)
                 return False
 
     async def disconnect(self):
