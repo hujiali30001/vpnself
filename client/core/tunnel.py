@@ -46,6 +46,7 @@ class TunnelStream:
         self._tunnel = tunnel
         self._buffer: asyncio.Queue = asyncio.Queue()
         self._buffered_bytes = 0
+        self._leftover = b""  # remainder of a chunk from a partial read(n)
         self._closed = False
         self._connect_future: asyncio.Future | None = None
         self._bytes_recv = 0
@@ -60,8 +61,19 @@ class TunnelStream:
         """Read data from this stream.
 
         With n < 0, drains all currently-queued chunks (coalescing them) and
-        blocks only if the queue is empty. With n >= 0, returns the next chunk.
+        blocks only if the queue is empty. With n >= 0, returns up to n bytes;
+        any remainder of the chunk is held and returned by the next read.
         """
+        # Serve any leftover from a previous partial read first, so no bytes
+        # are ever dropped when the caller asks for fewer than a chunk holds.
+        if self._leftover:
+            if n < 0 or n >= len(self._leftover):
+                data, self._leftover = self._leftover, b""
+            else:
+                data, self._leftover = self._leftover[:n], self._leftover[n:]
+            self._buffered_bytes -= len(data)
+            self._bytes_recv += len(data)
+            return data
         if self._closed:
             return b""
         try:
@@ -72,6 +84,7 @@ class TunnelStream:
                     try:
                         chunk = self._buffer.get_nowait()
                         if chunk is None:
+                            self._closed = True
                             break
                         data += chunk
                     except asyncio.QueueEmpty:
@@ -85,14 +98,17 @@ class TunnelStream:
                 self._bytes_recv += len(data)
                 return data
             else:
-                # Read exactly n bytes (or less if EOF)
+                # Return up to n bytes; stash the rest for the next read.
                 data = await self._buffer.get()
                 if data is None:
                     self._closed = True
                     return b""
+                if n < len(data):
+                    self._leftover = data[n:]
+                    data = data[:n]
                 self._buffered_bytes -= len(data)
                 self._bytes_recv += len(data)
-                return data[:n]
+                return data
         except Exception:
             self._closed = True
             return b""
@@ -491,7 +507,7 @@ class TunnelPool:
                            i, r if isinstance(r, Exception) else "auth/connect failed")
                 if i not in self._reconnect_tasks:
                     self._reconnect_tasks[i] = asyncio.create_task(
-                        self._reconnect_one(i, first=True))
+                        self._reconnect_one(i))
 
         log.info("POOL: %d/%d tunnels connected", connected, self.pool_size)
         return connected > 0
@@ -563,8 +579,8 @@ class TunnelPool:
                 except Exception:
                     pass
 
-    async def _reconnect_one(self, index: int, first: bool = False):
-        delay = POOL_RECONNECT_DELAY if not first else 5.0
+    async def _reconnect_one(self, index: int):
+        delay = POOL_RECONNECT_DELAY
         while self._running and index < len(self._tunnels):
             t = self._tunnels[index]
             if t.connected:

@@ -115,3 +115,16 @@ async def test_stream_buffer_bytes_decrease_on_read():
     data = await s.read(-1)          # drains all queued chunks
     assert len(data) == 1500
     assert s._buffered_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_partial_read_keeps_remainder():
+    """read(n) returns at most n bytes and preserves the rest for the next
+    read -- a chunk larger than n must never be silently truncated."""
+    s = TunnelStream(4, tunnel=None)
+    s.feed_data(b"HELLO_WORLD_1234")  # 16 bytes in one chunk
+    assert await s.read(5) == b"HELLO"
+    assert await s.read(5) == b"_WORL"
+    assert await s.read(100) == b"D_1234"   # remainder, not dropped
+    assert s._buffered_bytes == 0
+    assert s._bytes_recv == 16              # accounting counts only delivered bytes
