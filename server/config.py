@@ -6,6 +6,10 @@ import json
 import sys
 from pathlib import Path
 
+from common.utils import get_logger
+
+log = get_logger("server.config")
+
 DEFAULT_CONFIG = {
     "listen_host": "0.0.0.0",
     "listen_port": 8443,
@@ -37,7 +41,9 @@ def load_config(path: Path | None = None) -> dict:
             with open(p, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             merged = {**DEFAULT_CONFIG, **cfg}
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning("server_config.json at %s is unreadable (%s) -- "
+                        "using built-in defaults (check PSK!)", p, e)
             merged = dict(DEFAULT_CONFIG)
     else:
         merged = dict(DEFAULT_CONFIG)

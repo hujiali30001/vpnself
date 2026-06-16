@@ -6,6 +6,10 @@ import json
 import sys
 from pathlib import Path
 
+from common.utils import get_logger
+
+log = get_logger("client.config")
+
 DEFAULT_CONFIG = {
     "server_host": "your_jp_server_ip_or_domain",
     "server_port": 8443,
@@ -40,8 +44,9 @@ def load_config(path: Path | None = None) -> dict:
                 cfg = json.load(f)
             merged = {**DEFAULT_CONFIG, **cfg}
             return merged
-        except (json.JSONDecodeError, OSError):
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning("client_config.json at %s is unreadable (%s) -- "
+                        "regenerating with defaults", p, e)
     with open(p, "w", encoding="utf-8") as f:
         json.dump(DEFAULT_CONFIG, f, indent=2)
     return dict(DEFAULT_CONFIG)

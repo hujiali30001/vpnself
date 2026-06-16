@@ -255,8 +255,8 @@ class MainWindow(QMainWindow):
             asyncio.set_event_loop(self._loop)
             try:
                 self._loop.run_forever()
-            except Exception:
-                pass
+            except Exception as e:
+                log.error("异步事件循环异常退出: %s", e, exc_info=True)
             finally:
                 # Cancel all pending tasks
                 pending = asyncio.all_tasks(self._loop)
@@ -307,6 +307,9 @@ class MainWindow(QMainWindow):
             )
 
             pool_size = int(self._config.get("pool_size", POOL_DEFAULT_SIZE))
+            log.info("隧道池: %d 条连接, 乐观流水线=%s, 验证证书=%s",
+                     pool_size, self._config.get("optimistic_connect", False),
+                     self._config.get("verify_cert", False))
             self._pool = TunnelPool(tunnel_config, pool_size)
             # Auto-reconnect when tunnel drops
             self._pool.on_disconnect(lambda: self._run_async(self._auto_reconnect()))
