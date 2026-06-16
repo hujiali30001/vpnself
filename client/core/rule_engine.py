@@ -153,7 +153,8 @@ class RuleEngine:
         """Load rules from a JSON file."""
         p = Path(path)
         if not p.exists():
-            log.warning("Rules file not found: %s, loading built-in defaults", p)
+            # Expected on first run / frozen build (no rules file is shipped).
+            log.info("No rules file at %s -- using built-in defaults", p)
             self._load_defaults()
             return
 

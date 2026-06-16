@@ -31,7 +31,7 @@ def main():
 
     # Load config early for log level
     config = load_client_config()
-    log_level = getattr(logging, config.get("log_level", "DEBUG"))
+    log_level = getattr(logging, config.get("log_level", "INFO"))
 
     # Setup logging BEFORE creating the window
     # Use EXE directory when frozen, source dir when running from source
@@ -52,7 +52,7 @@ def main():
     log = get_logger("client.main")
     log.info("=" * 60)
     log.info("Furun VPN Client starting...")
-    log.info("Log level: %s", config.get("log_level", "DEBUG"))
+    log.info("Log level: %s", config.get("log_level", "INFO"))
     log.info("Log dir: %s", log_dir)
     log.info("=" * 60)
 

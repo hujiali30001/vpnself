@@ -223,8 +223,9 @@ class ForwardProxy:
 
                 return relay
             except asyncio.TimeoutError:
-                log.warning("Stream %d: CONNECT TIMEOUT (DNS/TCP) to %s:%d",
-                            stream_id, host, port)
+                # DNS is already resolved above; this is purely the TCP connect.
+                log.warning("Stream %d: TCP connect timeout (>%.0fs) to %s:%d",
+                            stream_id, self.CONNECT_TIMEOUT, host, port)
                 await send_frame_locked(tunnel_writer, write_lock,
                                         pack_connect_fail_func(stream_id, "Connection timeout"))
                 return None
