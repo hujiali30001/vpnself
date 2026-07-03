@@ -10,7 +10,7 @@ import hmac
 
 from common.protocol import (
     Cmd, FRAME_HEADER_SIZE, unpack_frame, pack_connect_ok, pack_connect_fail,
-    pack_pong, pack_data, unpack_connect,
+    pack_pong, pack_data, pack_close, unpack_connect,
 )
 from common.crypto import create_server_ssl_context
 from common.utils import get_logger
@@ -90,7 +90,16 @@ class TunnelServer:
                 self.forward_proxy.remove_relay(client_id, stream_id)
                 relay.close()
             else:
-                task = asyncio.create_task(relay.relay_target_to_tunnel(pack_data))
+                # When the target side ends, relay_target_to_tunnel sends CLOSE
+                # to the client and runs this callback to deregister the relay
+                # and drop the (now-finished) task from active_streams, so
+                # target-closed streams don't accumulate for a long-lived client.
+                def _on_stream_done(sid=stream_id):
+                    self.forward_proxy.remove_relay(client_id, sid)
+                    active_streams.pop(sid, None)
+
+                task = asyncio.create_task(relay.relay_target_to_tunnel(
+                    pack_data, pack_close, _on_stream_done))
                 active_streams[stream_id] = task
                 log.debug("[S%d] Relay task started (active streams: %d)",
                           stream_id, len(active_streams))
@@ -136,7 +145,7 @@ class TunnelServer:
                           peer[0], peer[1], len(data), len(buf))
 
                 while True:
-                    result = unpack_frame(buf[pos:])
+                    result = unpack_frame(buf, pos)
                     if result is None:
                         break
                     stream_id, cmd, payload = result

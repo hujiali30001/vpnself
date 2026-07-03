@@ -106,24 +106,37 @@ class CircuitBreaker:
         log.info("CB: %s TLS-reject detected (stat only, not blocking)", ip)
 
     def get_blocked_count(self) -> int:
+        # Snapshot with list() before iterating: these getters run on the Qt GUI
+        # thread (2s stats timer) while the asyncio loop thread mutates the dicts.
+        # list(dict.values()) is a single atomic C-level copy under the GIL, so it
+        # cannot raise "dictionary changed size during iteration".
         now = time.time()
-        return sum(1 for until in self._blocked.values() if now <= until)
+        return sum(1 for until in list(self._blocked.values()) if now <= until)
 
     def get_failure_count(self) -> int:
-        return sum(len(v) for v in self._failures.values())
+        return sum(len(v) for v in list(self._failures.values()))
 
     def get_tls_reject_count(self) -> int:
         return self._tls_reject_total
 
     def _prune(self):
-        """Remove oldest IPs by count (per-IP, not per-timestamp)."""
+        """Sweep expired blocks and cap tracked-failure entries."""
+        # Sweep logically-expired blocks so an IP that was blocked once and never
+        # re-queried does not linger (and get persisted) for the whole process.
+        now = time.time()
+        for ip in [ip for ip, until in list(self._blocked.items()) if now > until]:
+            del self._blocked[ip]
+
         if len(self._failures) > MAX_ENTRIES:
             newest = sorted(
                 self._failures.items(),
                 key=lambda kv: max(kv[1]) if kv[1] else 0,
                 reverse=True,
             )[:MAX_ENTRIES]
-            self._failures = dict(newest)
+            # Preserve the defaultdict type -- record_failure relies on
+            # auto-vivification (self._failures[ip].append(...)); a plain dict
+            # would raise KeyError for every new IP after the first prune.
+            self._failures = defaultdict(list, newest)
 
     def _schedule_save(self):
         """Mark state dirty; save happens on next prune/is_blocked call."""
@@ -164,14 +177,17 @@ class CircuitBreaker:
             log.debug("CB: no valid state file: %s", e)
 
     def save(self):
-        """Persist current state to disk."""
+        """Persist current state to disk (dropping already-expired blocks)."""
         try:
+            now = time.time()
             data = {
-                "blocked": dict(self._blocked),
+                "blocked": {ip: until for ip, until in self._blocked.items() if now <= until},
                 "failures": {ip: times[-20:] for ip, times in self._failures.items() if times},
             }
-            with open(self._path, "w", encoding="utf-8") as f:
+            tmp = self._path.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f)
+            tmp.replace(self._path)
             log.debug("CB: saved %d blocked + %d failures to %s",
                       len(self._blocked),
                       sum(len(v) for v in self._failures.values()),

@@ -9,8 +9,8 @@ import socket
 from dataclasses import dataclass
 
 from common.protocol import (
-    Cmd, FRAME_HEADER_SIZE, pack_frame, unpack_frame, pack_auth, pack_connect,
-    pack_close, pack_ping, pack_pong,
+    Cmd, FRAME_HEADER_SIZE, MAX_FRAME_SIZE, pack_frame, unpack_frame, pack_auth,
+    pack_connect, pack_close, pack_ping, pack_pong,
 )
 from common.crypto import create_client_ssl_context
 from common.utils import get_logger
@@ -210,7 +210,7 @@ class TunnelClient:
                     # Per-tunnel; the pool aggregates and the GUI surfaces the
                     # user-facing error when the whole connection fails.
                     log.warning("TUNNEL: AUTH FAILED (check PSK)")
-                    self._writer.close()
+                    self._cleanup_socket()
                     return False
                 self._authenticated = True
                 self._connected = True
@@ -226,14 +226,30 @@ class TunnelClient:
             except asyncio.TimeoutError:
                 # One tunnel among the pool; non-fatal and auto-retried, so this
                 # is a warning, not an error (the pool/GUI report real severity).
+                # Close any socket opened before the timeout (e.g. AUTH read
+                # timed out after open_connection succeeded) so it doesn't leak.
                 log.warning("TUNNEL: connection timeout (%.1fs)", self.config.connect_timeout)
+                self._cleanup_socket()
                 return False
             except (ConnectionError, OSError) as e:
                 log.warning("TUNNEL: connection failed: %s", e)
+                self._cleanup_socket()
                 return False
             except ssl.SSLError as e:
                 log.warning("TUNNEL: TLS handshake failed: %s", e)
+                self._cleanup_socket()
                 return False
+
+    def _cleanup_socket(self):
+        """Close and drop the writer/reader after a failed connect attempt."""
+        w = self._writer
+        if w is not None:
+            try:
+                w.close()
+            except Exception:
+                pass
+        self._writer = None
+        self._reader = None
 
     async def disconnect(self):
         self._running = False
@@ -247,7 +263,14 @@ class TunnelClient:
                 except asyncio.CancelledError:
                     pass
         for sid in list(self._streams.keys()):
-            self._streams.pop(sid).close()
+            stream = self._streams.pop(sid)
+            # Fail any create_stream() still blocked on this stream's connect
+            # future, so it returns immediately instead of waiting the full
+            # CONNECT timeout on an already-dead tunnel.
+            fut = stream._connect_future
+            if fut is not None and not fut.done():
+                fut.set_exception(ConnectionError("tunnel disconnected"))
+            stream.close()
         if self._writer:
             try:
                 self._writer.close()
@@ -311,6 +334,13 @@ class TunnelClient:
             self._streams[sid] = stream
 
         log.debug("TUNNEL: [S%d] opening -> %s:%d", sid, target_host, target_port)
+
+        # Create the connect future BEFORE sending CONNECT, so a CONNECT_OK/FAIL
+        # that arrives before this coroutine resumes is delivered to a real
+        # future instead of being silently dropped by the read loop.
+        if not self.config.optimistic_connect:
+            stream._connect_future = asyncio.Future()
+
         if not await self._send(pack_connect(sid, target_host, target_port)):
             log.warning("TUNNEL: [S%d] CONNECT send failed, pool will retry", sid)
             self._streams.pop(sid, None)
@@ -325,7 +355,6 @@ class TunnelClient:
                       sid, len(self._streams))
             return stream
 
-        stream._connect_future = asyncio.Future()
         try:
             await asyncio.wait_for(stream._connect_future, timeout=timeout)
             if stream.closed:
@@ -341,6 +370,11 @@ class TunnelClient:
             stream.close()
             await self._send(pack_close(sid))
             return None
+        except ConnectionError:
+            # disconnect() failed the future: the tunnel died mid-connect.
+            log.debug("TUNNEL: [S%d] CONNECT aborted -- tunnel disconnected", sid)
+            self._streams.pop(sid, None)
+            return None
 
     async def send_data(self, sid: int, data: bytes):
         if not self.connected:
@@ -349,7 +383,17 @@ class TunnelClient:
         if not stream or stream.closed:
             return
         stream._bytes_sent += len(data)
-        await self._send(pack_frame(sid, Cmd.DATA, data))
+        # Chunk oversized payloads: a DATA frame larger than the receiver's
+        # MAX_FRAME_SIZE is treated as a corrupt header and desyncs the shared
+        # tunnel. Relay reads are <=64KB, but a plain-HTTP body write can be
+        # arbitrarily large, so guard it here.
+        max_payload = MAX_FRAME_SIZE - FRAME_HEADER_SIZE
+        if len(data) <= max_payload:
+            await self._send(pack_frame(sid, Cmd.DATA, data))
+        else:
+            for i in range(0, len(data), max_payload):
+                if not await self._send(pack_frame(sid, Cmd.DATA, data[i:i + max_payload])):
+                    break
 
     async def close_stream(self, sid: int):
         stream = self._streams.pop(sid, None)
@@ -374,7 +418,7 @@ class TunnelClient:
                     pos = 0
                 buf += data
                 while True:
-                    result = unpack_frame(buf[pos:])
+                    result = unpack_frame(buf, pos)
                     if result is None:
                         break
                     sid, cmd, payload = result
@@ -470,10 +514,12 @@ class TunnelPool:
         self._tunnels: list[TunnelClient] = []
         self._rr_index = 0
         self._rr_lock = asyncio.Lock()
+        self._connect_lock = asyncio.Lock()  # serialize connect() calls
         self._running = False
         self._on_disconnect: list[callable] = []
         self._reconnect_tasks: dict[int, asyncio.Task] = {}
         self._pid = 0
+        self._down_notified = False  # latch: pool on_disconnect fired once per all-down
 
     @property
     def connected(self) -> bool:
@@ -499,44 +545,55 @@ class TunnelPool:
     async def connect(self) -> bool:
         """Connect all tunnels. Returns True if at least one connected.
 
-        Safe to call again while reconnect tasks are in flight (e.g. from a
-        GUI-driven reconnect): any pending per-tunnel reconnect tasks are
-        cancelled first so they do not index into the rebuilt tunnel list.
+        Serialized by _connect_lock so overlapping calls (GUI reconnect +
+        auto-reconnect firing together) cannot run concurrently and orphan a
+        fully-connected batch of tunnels. Any tunnels from a previous session
+        are torn down before the list is rebuilt, so their sockets and
+        read/ping/health tasks never leak.
         """
-        self._running = True
+        async with self._connect_lock:
+            self._running = True
+            self._down_notified = False  # re-arm the all-down latch
 
-        # Cancel and clear any in-flight per-tunnel reconnect tasks from a
-        # previous session before we replace self._tunnels out from under them.
-        for task in self._reconnect_tasks.values():
-            task.cancel()
-        self._reconnect_tasks.clear()
+            # Cancel in-flight per-tunnel reconnect tasks from a previous session
+            # before we replace self._tunnels out from under them.
+            for task in self._reconnect_tasks.values():
+                task.cancel()
+            self._reconnect_tasks.clear()
 
-        self._tunnels = []
+            # Tear down any previous tunnels before abandoning them: a repeat
+            # connect() must not leave a prior batch's live TLS sockets +
+            # background tasks running with no reference to ever close them.
+            old = self._tunnels
+            self._tunnels = []
+            if old:
+                await asyncio.gather(
+                    *[t.disconnect() for t in old], return_exceptions=True)
 
-        for _ in range(self.pool_size):
-            t = TunnelClient(self.config)
-            self._pid += 1
-            t._pool_index = self._pid
-            t.on_disconnect(self._make_on_lost(t._pool_index))
-            self._tunnels.append(t)
+            for _ in range(self.pool_size):
+                t = TunnelClient(self.config)
+                self._pid += 1
+                t._pool_index = self._pid
+                t.on_disconnect(self._make_on_lost(t._pool_index))
+                self._tunnels.append(t)
 
-        results = await asyncio.gather(
-            *[t.connect() for t in self._tunnels], return_exceptions=True)
+            results = await asyncio.gather(
+                *[t.connect() for t in self._tunnels], return_exceptions=True)
 
-        connected = 0
-        for i, r in enumerate(results):
-            if r is True:
-                connected += 1
-            else:
-                log.warning("POOL: tunnel[%d] failed to connect (%s), "
-                           "will retry in background",
-                           i, r if isinstance(r, Exception) else "auth/connect failed")
-                if i not in self._reconnect_tasks:
-                    self._reconnect_tasks[i] = asyncio.create_task(
-                        self._reconnect_one(i))
+            connected = 0
+            for i, r in enumerate(results):
+                if r is True:
+                    connected += 1
+                else:
+                    log.warning("POOL: tunnel[%d] failed to connect (%s), "
+                               "will retry in background",
+                               i, r if isinstance(r, Exception) else "auth/connect failed")
+                    if i not in self._reconnect_tasks:
+                        self._reconnect_tasks[i] = asyncio.create_task(
+                            self._reconnect_one(i))
 
-        log.info("POOL: %d/%d tunnels connected", connected, self.pool_size)
-        return connected > 0
+            log.info("POOL: %d/%d tunnels connected", connected, self.pool_size)
+            return connected > 0
 
     async def disconnect(self):
         self._running = False
@@ -562,17 +619,21 @@ class TunnelPool:
         rejected the target (don't retry -- every tunnel fails identically),
         or None if no connected tunnel could carry the stream.
         """
-        if not self._tunnels:
+        # Snapshot the tunnel list: disconnect() can clear it in place while this
+        # coroutine is suspended on an await below, and indexing the live list
+        # would then raise IndexError.
+        tunnels = list(self._tunnels)
+        n = len(tunnels)
+        if not n:
             return None
 
-        n = len(self._tunnels)
         async with self._rr_lock:
             start = self._rr_index % n
             self._rr_index += 1
 
         for offset in range(n):
             idx = (start + offset) % n
-            t = self._tunnels[idx]
+            t = tunnels[idx]
             if not t.connected:
                 continue
             stream = await t.create_stream(target_host, target_port, timeout=timeout)
@@ -606,7 +667,12 @@ class TunnelPool:
                         self._reconnect_one(i))
                 break
 
-        if not self.connected and self._running:
+        # Fire the pool-level on_disconnect ONCE per all-down transition. Without
+        # this latch, all 128 tunnels dying together (server restart) each see
+        # "not connected" and re-fire the callback, spawning a storm of
+        # reconnect coroutines. Re-armed in connect()/_reconnect_one on recovery.
+        if not self.connected and self._running and not self._down_notified:
+            self._down_notified = True
             log.warning("POOL: all tunnels down")
             for cb in self._on_disconnect:
                 try:
@@ -627,6 +693,7 @@ class TunnelPool:
                 ok = await t.connect()
                 if ok:
                     log.info("POOL: tunnel[%d] reconnected", index)
+                    self._down_notified = False  # re-arm: pool has capacity again
                     break
             except Exception as e:
                 log.warning("POOL: tunnel[%d] reconnect failed: %s", index, e)

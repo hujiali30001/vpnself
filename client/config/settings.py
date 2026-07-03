@@ -3,12 +3,30 @@ Furun VPN - Client Configuration
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
 from common.utils import get_logger
 
 log = get_logger("client.config")
+
+
+def _atomic_write_json(path: Path, data: dict):
+    """Write JSON to ``path`` atomically (tmp file + os.replace).
+
+    A crash/power loss mid-write leaves the original file intact rather than a
+    truncated one, so an interrupted save can never silently reset the config.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass  # best-effort durability; some filesystems don't support it
+    os.replace(tmp, path)
 
 DEFAULT_CONFIG = {
     "server_host": "your_jp_server_ip_or_domain",
@@ -42,18 +60,36 @@ def load_config(path: Path | None = None) -> dict:
         try:
             with open(p, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
-            merged = {**DEFAULT_CONFIG, **cfg}
-            return merged
-        except (json.JSONDecodeError, OSError) as e:
+            if not isinstance(cfg, dict):
+                # Valid JSON but not an object (null/list/number) -> the merge
+                # below would raise TypeError; treat as corrupt instead.
+                raise ValueError("config root must be a JSON object")
+            return {**DEFAULT_CONFIG, **cfg}
+        except (json.JSONDecodeError, ValueError, TypeError, OSError) as e:
+            # Preserve the unreadable file rather than destroying it, so an
+            # interrupted save that truncated it doesn't permanently lose the
+            # user's server_host / psk (recoverable from the .bak).
             log.warning("client_config.json at %s is unreadable (%s) -- "
-                        "regenerating with defaults", p, e)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(DEFAULT_CONFIG, f, indent=2)
+                        "backing up to .bak and regenerating with defaults", p, e)
+            try:
+                p.replace(p.with_name(p.name + ".bak"))
+            except OSError:
+                pass
+    # Create/regenerate the default config. A write failure (e.g. read-only
+    # install dir) must not crash startup -- fall back to in-memory defaults.
+    try:
+        _atomic_write_json(p, DEFAULT_CONFIG)
+    except OSError as e:
+        log.warning("Could not write default client_config.json at %s: %s", p, e)
     return dict(DEFAULT_CONFIG)
 
 
-def save_config(config: dict, path: Path | None = None):
-    """Save client configuration to JSON."""
+def save_config(config: dict, path: Path | None = None) -> bool:
+    """Save client configuration to JSON atomically. Returns True on success."""
     p = path or (_get_config_dir() / "client_config.json")
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
+    try:
+        _atomic_write_json(p, config)
+        return True
+    except OSError as e:
+        log.error("保存配置失败 %s: %s", p, e)
+        return False

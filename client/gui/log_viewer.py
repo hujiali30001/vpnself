@@ -1,32 +1,46 @@
-﻿"""
+"""
 Furun VPN - Log Viewer Widget
 
-嵌入式日志查看器 -- 可滚动、可过滤的实时日志面板。
+嵌入式日志查看器 -- 可滚动、可过滤、按级别着色的实时日志面板。
 """
+
+import html
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPlainTextEdit,
-    QPushButton, QCheckBox,
+    QPushButton, QCheckBox, QLineEdit, QLabel,
 )
 from PyQt6.QtGui import QFont
 
+# Catppuccin Mocha level colours.
+LEVEL_COLORS = {
+    "ERROR": "#f38ba8",
+    "CRITICAL": "#f38ba8",
+    "WARNING": "#f9e2af",
+    "DEBUG": "#6c7086",
+    "INFO": "#cdd6f4",
+}
+
 
 class LogViewer(QWidget):
-    """可滚动、可筛选的日志查看器"""
+    """可滚动、可筛选、按级别着色的日志查看器"""
 
     MAX_LINES = 5000
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._build_ui()
         self._auto_scroll = True
         self._all_lines: list[tuple[str, str]] = []  # (message, level)
+        self._filter_text = ""
+        self._build_ui()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
 
         ctrl_layout = QHBoxLayout()
+        ctrl_layout.setSpacing(8)
         self.auto_scroll_cb = QCheckBox("自动滚动")
         self.auto_scroll_cb.setChecked(True)
         self.auto_scroll_cb.toggled.connect(self._toggle_auto_scroll)
@@ -37,9 +51,15 @@ class LogViewer(QWidget):
         self.show_debug_cb.toggled.connect(self._apply_filter)
         ctrl_layout.addWidget(self.show_debug_cb)
 
+        ctrl_layout.addWidget(QLabel("筛选:"))
+        self.filter_input = QLineEdit()
+        self.filter_input.setPlaceholderText("按关键字过滤（域名 / 级别 / 消息）")
+        self.filter_input.setClearButtonEnabled(True)
+        self.filter_input.textChanged.connect(self._on_filter_changed)
+        ctrl_layout.addWidget(self.filter_input, 1)
+
         clear_btn = QPushButton("清空")
         clear_btn.clicked.connect(self.clear)
-        ctrl_layout.addStretch()
         ctrl_layout.addWidget(clear_btn)
         layout.addLayout(ctrl_layout)
 
@@ -47,19 +67,38 @@ class LogViewer(QWidget):
         self.text_edit.setReadOnly(True)
         self.text_edit.setMaximumBlockCount(self.MAX_LINES)
         self.text_edit.setFont(QFont("Cascadia Code", 10))
+        self.text_edit.setPlaceholderText("等待日志输出…")
         layout.addWidget(self.text_edit)
 
     def _toggle_auto_scroll(self, checked: bool):
         self._auto_scroll = checked
 
+    def _on_filter_changed(self, text: str):
+        self._filter_text = text.strip().lower()
+        self._apply_filter()
+
+    def _visible(self, message: str, level: str) -> bool:
+        if level == "DEBUG" and not self.show_debug_cb.isChecked():
+            return False
+        if self._filter_text and self._filter_text not in message.lower() \
+                and self._filter_text not in level.lower():
+            return False
+        return True
+
+    def _append_html(self, message: str, level: str):
+        color = LEVEL_COLORS.get(level, "#cdd6f4")
+        safe = html.escape(message)
+        self.text_edit.appendHtml(f'<span style="color:{color};">{safe}</span>')
+
     def _apply_filter(self):
-        """Rebuild display content based on debug filter toggle."""
-        show_debug = self.show_debug_cb.isChecked()
+        """Rebuild display content based on the debug toggle and text filter."""
         self.text_edit.clear()
         for message, level in self._all_lines:
-            if level == "DEBUG" and not show_debug:
-                continue
-            self.text_edit.appendPlainText(message)
+            if self._visible(message, level):
+                self._append_html(message, level)
+        if self._auto_scroll:
+            sb = self.text_edit.verticalScrollBar()
+            sb.setValue(sb.maximum())
 
     def append_log(self, message: str, level: str = "INFO"):
         self._all_lines.append((message, level))
@@ -67,12 +106,16 @@ class LogViewer(QWidget):
         # long-running session does not grow _all_lines without bound.
         if len(self._all_lines) > self.MAX_LINES:
             del self._all_lines[:len(self._all_lines) - self.MAX_LINES]
-        if level == "DEBUG" and not self.show_debug_cb.isChecked():
+        if not self._visible(message, level):
             return
-        self.text_edit.appendPlainText(message)
+        self._append_html(message, level)
         if self._auto_scroll:
             scrollbar = self.text_edit.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
+
+    def get_full_text(self) -> str:
+        """Return the full retained history (all levels), for export."""
+        return "\n".join(msg for msg, _ in self._all_lines)
 
     def clear(self):
         self._all_lines.clear()

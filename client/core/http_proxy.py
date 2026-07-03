@@ -29,8 +29,12 @@ class HttpConnectProxy:
 
     async def start(self):
         self._running = True
+        # limit=256KB: the default StreamReader limit is 64KB, and a single
+        # request/header line at or above it makes readline() raise ValueError
+        # (LimitOverrunError), dropping the connection with no response. Browsers
+        # can legitimately send large cookie/header lines, so raise the ceiling.
         self._server = await asyncio.start_server(
-            self._handle, host=self.host, port=self.port)
+            self._handle, host=self.host, port=self.port, limit=256 * 1024)
         log.debug("HTTP CONNECT proxy on %s:%d", self.host, self.port)
 
     async def stop(self):
@@ -83,7 +87,8 @@ class HttpConnectProxy:
                          self._total, host or "?", port or 0, up, down)
 
         except (asyncio.TimeoutError, asyncio.IncompleteReadError,
-                ConnectionError, OSError) as e:
+                ConnectionError, OSError, ValueError) as e:
+            # ValueError: a request/header line exceeded the stream limit.
             log.debug("HTTP #%d: %s", self._total, e)
         except Exception as e:
             log.error("HTTP #%d: %s", self._total, e, exc_info=True)
@@ -124,8 +129,15 @@ class HttpConnectProxy:
             return host, port, None, None
 
         target_reader, target_writer = result
-        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        await writer.drain()
+        # Close the upstream if the client aborted while route() was building the
+        # tunnel stream (a slow pool connect can take seconds; browsers time out
+        # and reset). Otherwise the tunnel stream + its background tasks leak.
+        try:
+            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await writer.drain()
+        except (ConnectionError, OSError):
+            target_writer.close()
+            return host, port, None, None
         return host, port, target_reader, target_writer
 
     # --- HTTP GET/POST handler ---
@@ -160,28 +172,18 @@ class HttpConnectProxy:
 
         log.debug("HTTP GET #%d: %s:%d%s", self._total, host, port, path)
 
-        # Read all headers
+        # Read request headers up to the blank line. The body (if any) is left
+        # unread in the client stream and forwarded by the bidirectional relay,
+        # so a large or slow upload is never buffered fully into RAM under a hard
+        # deadline before the target connection even exists.
         headers = [req + "\r\n"]
-        content_length = 0
         while True:
             line = await asyncio.wait_for(reader.readline(), 5.0)
             if not line:
                 break
-            line_str = line.decode("utf-8", "replace")
-            headers.append(line_str)
-            if line_str.lower().startswith("content-length:"):
-                try:
-                    content_length = int(line_str.split(":")[1].strip())
-                except ValueError:
-                    pass
+            headers.append(line.decode("utf-8", "replace"))
             if line.strip() == b"":
                 break
-
-        # Read body if present
-        body = b""
-        if content_length > 0:
-            body = await asyncio.wait_for(
-                reader.readexactly(content_length), 10.0)
 
         # Rewrite request line to remove scheme/host (relative path)
         headers[0] = "%s %s HTTP/1.1\r\n" % (method, path)
@@ -194,12 +196,14 @@ class HttpConnectProxy:
 
         target_reader, target_writer = result
 
-        # Forward the rewritten request
-        request_bytes = "".join(headers).encode("utf-8")
-        target_writer.write(request_bytes)
-        if body:
-            target_writer.write(body)
-        await target_writer.drain()
+        # Forward the rewritten request headers; the body streams via _relay.
+        # Close the upstream on failure so an aborted request doesn't leak it.
+        try:
+            target_writer.write("".join(headers).encode("utf-8"))
+            await target_writer.drain()
+        except (ConnectionError, OSError):
+            target_writer.close()
+            return host, port, None, None
 
         return host, port, target_reader, target_writer
 

@@ -29,9 +29,12 @@ def main():
     app.setOrganizationName("Furun")
     app.setQuitOnLastWindowClosed(False)
 
-    # Load config early for log level
+    # Load config early for log level. Normalize case and fall back to INFO on
+    # an unrecognized value so a stray 'debug'/typo can't crash startup.
     config = load_client_config()
-    log_level = getattr(logging, config.get("log_level", "INFO"))
+    log_level = getattr(logging, str(config.get("log_level", "INFO")).upper(), logging.INFO)
+    if not isinstance(log_level, int):
+        log_level = logging.INFO
 
     # Setup logging BEFORE creating the window
     # Use EXE directory when frozen, source dir when running from source

@@ -70,7 +70,15 @@ def setup_logging(name: str = "furun",
         Optional Qt signal handler for GUI display.
     """
     logger = logging.getLogger(name)
-    logger.setLevel(level)
+    # The logger's own level gates records BEFORE any handler sees them. The
+    # file/Qt handlers are intentionally set to DEBUG ("file always captures
+    # debug"), so the logger must sit at the lowest level any handler needs --
+    # otherwise every log.debug() is dropped here and never reaches them. The
+    # console handler keeps its own `level` so the console still respects it.
+    if file_rotate or debug_file or qt_handler is not None:
+        logger.setLevel(min(level, logging.DEBUG))
+    else:
+        logger.setLevel(level)
     logger.handlers.clear()
     logger.propagate = False  # Prevent double-logging via root
 
@@ -134,12 +142,13 @@ def get_logger(module_name: str) -> logging.Logger:
 def get_data_path(*parts: str) -> Path:
     """Get a data file path that works in both source and frozen EXE modes.
 
-    When frozen by PyInstaller, resolves relative to the EXE directory.
+    When frozen by PyInstaller, resolves relative to the EXE directory (persistent,
+    writable) -- NOT sys._MEIPASS, which is a onefile-build temp extraction dir that
+    PyInstaller deletes on exit, so anything written there is lost on next launch.
     When running from source, resolves relative to the project root (parent of common/).
     """
     if getattr(sys, "frozen", False):
-        # PyInstaller extracts data files into sys._MEIPASS, not next to EXE
-        base = Path(sys._MEIPASS)
+        base = Path(sys.executable).parent
     else:
         # Running from source: go up from common/ to project root
         base = Path(__file__).parent.parent
@@ -173,8 +182,13 @@ def resolve_host(host: str, port: int = 80) -> str:
 
 
 def ip_in_network(ip_str: str, network_str: str) -> bool:
-    """Check if an IP address belongs to a CIDR network."""
+    """Check if an IP address belongs to a CIDR network.
+
+    ``strict=False`` so human-written CIDRs with host bits set (e.g.
+    "10.0.0.5/24") are normalised to their network instead of raising
+    ValueError and silently reporting "not in network" for every address.
+    """
     try:
-        return ipaddress.ip_address(ip_str) in ipaddress.ip_network(network_str)
+        return ipaddress.ip_address(ip_str) in ipaddress.ip_network(network_str, strict=False)
     except ValueError:
         return False

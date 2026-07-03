@@ -20,6 +20,9 @@ DEFAULT_CONFIG = {
     "idle_timeout": 120,
     "log_file": "server.log",
     "log_level": "INFO",
+    # Optional: public DNS names / IPs to embed in the auto-generated cert's
+    # SubjectAlternativeName. Required for clients that set verify_cert=true.
+    "tls_san": [],
 }
 
 

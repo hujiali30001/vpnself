@@ -77,13 +77,22 @@ class ForwardRelay:
         self.write_lock = write_lock
         self._active = True
 
-    async def relay_target_to_tunnel(self, pack_data_func):
-        """Relay data from target back to tunnel."""
+    async def relay_target_to_tunnel(self, pack_data_func, pack_close_func=None,
+                                     on_close=None):
+        """Relay data from target back to tunnel.
+
+        When the target ends (EOF/error) rather than the tunnel write failing,
+        send a CLOSE frame to the client so its stream terminates promptly
+        (connection-close HTTP responses would otherwise hang until timeout),
+        and invoke ``on_close`` to deregister the relay.
+        """
         bytes_relayed = 0
+        target_ended = False
         try:
             while self._active:
                 data = await self.target_reader.read(self.BUFFER_SIZE)
                 if not data:
+                    target_ended = True
                     break
                 frame = pack_data_func(self.stream_id, data)
                 if not await send_frame_locked(self.tunnel_writer,
@@ -92,11 +101,20 @@ class ForwardRelay:
                     break
                 bytes_relayed += len(data)
         except (ConnectionError, asyncio.IncompleteReadError, OSError) as e:
+            target_ended = True
             log.debug("Stream %d: relay finished: %d bytes (%s)",
                      self.stream_id, bytes_relayed, e)
         finally:
             log.debug("Stream %d: relay closed (%d bytes total)",
                      self.stream_id, bytes_relayed)
+            if target_ended and pack_close_func is not None:
+                await send_frame_locked(self.tunnel_writer, self.write_lock,
+                                        pack_close_func(self.stream_id))
+            if on_close is not None:
+                try:
+                    on_close()
+                except Exception:
+                    pass
             self.close()
 
     def close(self):
@@ -169,6 +187,17 @@ class ForwardProxy:
                              write_lock: asyncio.Lock | None = None
                              ) -> ForwardRelay | None:
         """Establish a connection to target and return a relay, or None on failure."""
+        # Admission control: the semaphore below caps concurrent *connect
+        # attempts*, but it releases as soon as the connect returns, so open
+        # relays can pile up past max_connections. Reject once that many relays
+        # are already live so the server's socket/fd usage stays bounded.
+        if len(self._active_relays) >= self.max_connections:
+            log.warning("Stream %d: refusing CONNECT to %s:%d -- %d active relays >= max %d",
+                        stream_id, host, port, len(self._active_relays), self.max_connections)
+            await send_frame_locked(tunnel_writer, write_lock,
+                                    pack_connect_fail_func(stream_id, "server at capacity"))
+            return None
+
         # Resolve DNS outside the semaphore to avoid blocking other connections.
         # A DNS failure must still send CONNECT_FAIL, otherwise the client stream
         # hangs until its own timeout instead of fast-failing. Cache hits skip

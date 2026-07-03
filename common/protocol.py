@@ -42,19 +42,28 @@ def pack_frame(stream_id: int, cmd: Cmd, payload: bytes = b"") -> bytes:
     return frame
 
 
-def unpack_frame(data: bytes) -> tuple[int, Cmd, bytes] | None:
-    """Decode a protocol frame from bytes. Returns (stream_id, cmd, payload) or None if incomplete."""
-    if len(data) < FRAME_HEADER_SIZE:
+def unpack_frame(data: bytes, offset: int = 0) -> tuple[int, Cmd, bytes] | None:
+    """Decode a protocol frame from ``data`` starting at ``offset``.
+
+    Returns (stream_id, cmd, payload) or None if more bytes are needed. Parsing
+    is done in place via ``offset`` so read loops never re-slice ``buf[pos:]``
+    once per frame (which is O(n^2) when a single read holds many frames).
+    """
+    if len(data) - offset < FRAME_HEADER_SIZE:
         return None
-    total_len, stream_id, cmd_byte = struct.unpack("!IIB", data[:FRAME_HEADER_SIZE])
-    if len(data) < total_len:
-        return None
+    total_len, stream_id, cmd_byte = struct.unpack(
+        "!IIB", data[offset:offset + FRAME_HEADER_SIZE])
+    # Validate the declared length BEFORE the completeness check. An oversized
+    # length (up to 4 GB) would otherwise look like "need more bytes" forever,
+    # stalling the parser and letting the receive buffer grow unbounded -- a
+    # pre-auth OOM DoS from a single hostile/corrupt header. Resync instead by
+    # returning a dummy PONG so the caller skips just this 9-byte header.
     if total_len > MAX_FRAME_SIZE or total_len < FRAME_HEADER_SIZE:
         log.warning("Frame size %d out of valid range [%d, %d] -- discarding header", total_len, FRAME_HEADER_SIZE, MAX_FRAME_SIZE)
-        # Return dummy PONG so caller advances FRAME_HEADER_SIZE bytes past corrupt header.
-        # PONG is no-op on both client and server.
         return (stream_id, Cmd.PONG, b"")
-    payload = data[FRAME_HEADER_SIZE:total_len]
+    if len(data) - offset < total_len:
+        return None
+    payload = data[offset + FRAME_HEADER_SIZE:offset + total_len]
     try:
         cmd = Cmd(cmd_byte)
     except ValueError:

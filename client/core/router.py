@@ -124,19 +124,21 @@ class Router:
         self.rule_engine = rule_engine
         self.circuit_breaker = CircuitBreaker()
         self._dns_cache: dict[str, tuple[float, str]] = {}
-        self._proxy_fail: dict[str, float] = {}  # host -> expiry_monotonic (server-unreachable)
+        self._proxy_fail: dict[tuple[str, int], float] = {}  # (host, port) -> expiry_monotonic
         self._stats = {
             "direct_connections": 0,
             "proxy_connections": 0,
             "blocked_connections": 0,
             "failed_connections": 0,
-            "cb_blocked": 0,
+            "cb_blocked": 0,       # attempts denied by the circuit breaker
+            "bytes_up": 0,         # cumulative bytes sent to targets this session
+            "bytes_down": 0,       # cumulative bytes received from targets
         }
 
     @property
     def stats(self) -> dict:
-        s = dict(self._stats)
-        s["cb_blocked"] = self.circuit_breaker.get_blocked_count()
+        s = dict(self._stats)  # keeps cb_blocked as the attempts-denied counter
+        s["cb_blocked_ips"] = self.circuit_breaker.get_blocked_count()  # gauge: IPs currently blocked
         s["cb_tracked"] = self.circuit_breaker.get_failure_count()
         s["cb_tls_rejects"] = self.circuit_breaker.get_tls_reject_count()
         return s
@@ -144,19 +146,20 @@ class Router:
     async def record_stream_result(self, host: str, bytes_sent: int, bytes_recv: int):
         if bytes_sent == 0 and bytes_recv == 0:
             return
+        self._stats["bytes_up"] += bytes_sent
+        self._stats["bytes_down"] += bytes_recv
         if is_ip_address(host):
             resolved_ip = host
         else:
-            # Reuse the DNS answer route() just cached; only fall back to a
-            # fresh lookup on a miss, so we don't pay a second resolve per
-            # completed stream.
+            # Reuse the DNS answer route() cached. A miss means route() never
+            # resolved this host locally -- i.e. it was proxied by an explicit
+            # domain rule -- so the circuit breaker (which only gates DIRECT
+            # routes) has no interest in it. Skip rather than pay a fresh local
+            # lookup per completed proxy stream (the project resolves on the
+            # server side by design).
             resolved_ip = self._cached_resolve(host)
             if resolved_ip is None:
-                try:
-                    resolved_ip = await asyncio.get_running_loop().run_in_executor(
-                        None, resolve_host, host)
-                except Exception:
-                    return
+                return
         if not resolved_ip or not is_ip_address(resolved_ip):
             return
         if bytes_sent > TLS_OK_MIN_SENT or bytes_recv > TLS_OK_MIN_RECV:
@@ -193,26 +196,36 @@ class Router:
                                                                asyncio.StreamWriter] | None:
         log.debug("ROUTE %s:%d", host, port)
 
-        resolved_ip = None
-        if is_ip_address(host):
-            resolved_ip = host
-        else:
-            resolved_ip = self._cached_resolve(host)
-            if resolved_ip is None:
-                try:
-                    resolved_ip = await asyncio.get_running_loop().run_in_executor(
-                        None, resolve_host, host, port)
-                except Exception:
-                    resolved_ip = None
-                if resolved_ip and is_ip_address(resolved_ip):
-                    self._dns_cache[host] = (time.monotonic() + DNS_CACHE_TTL, resolved_ip)
-                    self._prune_dns_cache()
+        host_is_ip = is_ip_address(host)
+        resolved_ip = host if host_is_ip else self._cached_resolve(host)  # cached or None
 
-        # Explicit domain/IP rules take precedence over IP-based heuristics.
-        # A GFW-poisoned DNS answer (e.g. a bogus link-local or China-looking IP)
-        # must not override an explicit PROXY/BLOCK rule for the hostname.
-        action = self.rule_engine.evaluate_with_ip(host, resolved_ip)
-        if action == self.rule_engine.default_action:
+        # First pass: match explicit domain/IP rules by hostname (+ any cached
+        # IP). match_explicit returns None only when NO rule matched, so an
+        # explicit rule is honoured even when its action equals default_action.
+        action = self.rule_engine.match_explicit(host, resolved_ip)
+
+        # Resolve DNS only when an IP is actually needed: no rule matched (need
+        # heuristics), or the matched action is DIRECT (need the IP for the local
+        # connect + circuit breaker). PROXY/BLOCK by domain name skip the lookup
+        # -- the server resolves for PROXY, and BLOCK needs no IP. This removes a
+        # blocking getaddrinfo from the hot path for every proxied domain.
+        if (action is None or action == Action.DIRECT) and resolved_ip is None and not host_is_ip:
+            try:
+                resolved_ip = await asyncio.get_running_loop().run_in_executor(
+                    None, resolve_host, host, port)
+            except Exception:
+                resolved_ip = None
+            if resolved_ip and is_ip_address(resolved_ip):
+                self._dns_cache[host] = (time.monotonic() + DNS_CACHE_TTL, resolved_ip)
+                self._prune_dns_cache()
+            else:
+                resolved_ip = None
+            if action is None:
+                # Re-check explicit rules now that we have a resolved IP (IP CIDR
+                # rules can match the answer even when the hostname didn't).
+                action = self.rule_engine.match_explicit(host, resolved_ip)
+
+        if action is None:
             # No explicit rule matched; fall back to IP-based heuristics.
             if resolved_ip and is_special_ip(resolved_ip):
                 action = Action.DIRECT
@@ -220,6 +233,8 @@ class Router:
                 action = Action.DIRECT
             elif self.pool.connected:
                 action = Action.PROXY
+            else:
+                action = self.rule_engine.default_action
 
         if action == Action.DIRECT and resolved_ip and self.circuit_breaker.is_blocked(resolved_ip):
             self._stats["cb_blocked"] += 1
@@ -234,9 +249,13 @@ class Router:
         elif action == Action.DIRECT:
             self._stats["direct_connections"] += 1
             log.debug("DIRECT %s:%d", host, port)
+            # Connect to the exact IP the routing decision was made on, so the
+            # circuit-breaker bookkeeping below matches the socket we opened and
+            # we avoid a second, independent getaddrinfo inside open_connection.
+            connect_host = resolved_ip if (resolved_ip and is_ip_address(resolved_ip)) else host
             try:
                 reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port), timeout=10.0)
+                    asyncio.open_connection(connect_host, port), timeout=10.0)
                 if resolved_ip:
                     self.circuit_breaker.record_success(resolved_ip)
                 return reader, writer
@@ -262,8 +281,10 @@ class Router:
 
             # Fast-fail hosts the server recently reported unreachable, so a page
             # polling a dead host doesn't re-probe the tunnel on every request.
+            # Keyed by (host, port): a connection-refused is port-specific, so one
+            # dead port must not fast-fail every other port of the same host.
             now = time.monotonic()
-            exp = self._proxy_fail.get(host)
+            exp = self._proxy_fail.get((host, port))
             if exp is not None and now < exp:
                 self._stats["failed_connections"] += 1
                 log.debug("PROXY  %s:%d fast-fail (server reported unreachable)", host, port)
@@ -278,7 +299,7 @@ class Router:
             if stream is CONNECT_REJECTED:
                 # Host-level failure: every tunnel rejects this target the same
                 # way. Cache it so repeated requests fast-fail above.
-                self._proxy_fail[host] = now + PROXY_FAIL_TTL
+                self._proxy_fail[(host, port)] = now + PROXY_FAIL_TTL
                 self._prune_proxy_fail()
                 self._stats["failed_connections"] += 1
                 return None

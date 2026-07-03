@@ -74,6 +74,38 @@ QPushButton:disabled {
     color: #6c7086;
 }
 
+QPushButton:focus {
+    border: 1px solid #89b4fa;
+}
+
+QSpinBox {
+    background-color: #313244;
+    border: 1px solid #45475a;
+    border-radius: 4px;
+    padding: 5px 8px;
+    color: #cdd6f4;
+    selection-background-color: #89b4fa;
+}
+
+QSpinBox:focus {
+    border-color: #89b4fa;
+}
+
+QSpinBox:disabled {
+    background-color: #1e1e2e;
+    color: #6c7086;
+}
+
+QSpinBox::up-button, QSpinBox::down-button {
+    background-color: #45475a;
+    border: none;
+    width: 16px;
+}
+
+QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+    background-color: #585b70;
+}
+
 QPushButton#connectBtn {
     background-color: #a6e3a1;
     color: #1e1e2e;
@@ -102,6 +134,22 @@ QCheckBox {
 QCheckBox::indicator {
     width: 18px;
     height: 18px;
+    border: 1px solid #585b70;
+    border-radius: 4px;
+    background-color: #313244;
+}
+
+QCheckBox::indicator:hover {
+    border-color: #89b4fa;
+}
+
+QCheckBox::indicator:checked {
+    background-color: #89b4fa;
+    border-color: #89b4fa;
+}
+
+QCheckBox:focus {
+    color: #89b4fa;
 }
 
 QTableWidget {

@@ -4,16 +4,56 @@ Furun VPN - Rule Editor Dialog
 路由规则编辑器 — 管理域名规则和 IP CIDR 规则。
 """
 
+import ipaddress
+
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QPushButton, QLabel, QComboBox, QHeaderView,
-    QMessageBox, QTabWidget, QWidget,
+    QMessageBox, QTabWidget, QWidget, QStyledItemDelegate, QSpinBox,
 )
 from PyQt6.QtCore import Qt
 
 from client.core.rule_engine import Action, DomainRule, IpCidrRule
 
 COLUMNS = ["匹配规则", "动作", "优先级", "说明"]
+
+
+class _ComboDelegate(QStyledItemDelegate):
+    """Dropdown editor so the action column can only hold valid values."""
+
+    def __init__(self, items, parent=None):
+        super().__init__(parent)
+        self._items = items
+
+    def createEditor(self, parent, option, index):
+        cb = QComboBox(parent)
+        cb.addItems(self._items)
+        return cb
+
+    def setEditorData(self, editor, index):
+        i = editor.findText(index.data() or "")
+        editor.setCurrentIndex(i if i >= 0 else 0)
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.currentText())
+
+
+class _SpinDelegate(QStyledItemDelegate):
+    """Integer spin editor so priority can only hold a number."""
+
+    def createEditor(self, parent, option, index):
+        sp = QSpinBox(parent)
+        sp.setRange(0, 1000)
+        return sp
+
+    def setEditorData(self, editor, index):
+        try:
+            editor.setValue(int(index.data()))
+        except (TypeError, ValueError):
+            editor.setValue(0)
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, str(editor.value()))
 
 
 class RuleEditorDialog(QDialog):
@@ -56,6 +96,9 @@ class RuleEditorDialog(QDialog):
         self.domain_table.setColumnWidth(0, 220)
         self.domain_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.domain_table.setAlternatingRowColors(True)
+        self.domain_table.setItemDelegateForColumn(
+            1, _ComboDelegate(["direct", "proxy", "block"], self))
+        self.domain_table.setItemDelegateForColumn(2, _SpinDelegate(self))
         domain_layout.addWidget(self.domain_table)
 
         domain_btn_layout = QHBoxLayout()
@@ -82,6 +125,9 @@ class RuleEditorDialog(QDialog):
         self.ip_table.setColumnWidth(0, 220)
         self.ip_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.ip_table.setAlternatingRowColors(True)
+        self.ip_table.setItemDelegateForColumn(
+            1, _ComboDelegate(["direct", "proxy", "block"], self))
+        self.ip_table.setItemDelegateForColumn(2, _SpinDelegate(self))
         ip_layout.addWidget(self.ip_table)
 
         ip_btn_layout = QHBoxLayout()
@@ -151,6 +197,7 @@ class RuleEditorDialog(QDialog):
         self._set_rule_row(self.domain_table, row,
                            "*.example.com", "proxy", 0, "新规则")
         self._modified = True
+        self._focus_new_row(self.domain_table, row)
 
     def _add_ip_rule(self):
         row = self.ip_table.rowCount()
@@ -158,6 +205,14 @@ class RuleEditorDialog(QDialog):
         self._set_rule_row(self.ip_table, row,
                            "0.0.0.0/0", "direct", 0, "新 IP 规则")
         self._modified = True
+        self._focus_new_row(self.ip_table, row)
+
+    def _focus_new_row(self, table: QTableWidget, row: int):
+        """滚动到新增行并使其进入编辑状态，避免在长规则列表中被淹没而不可见。"""
+        table.scrollToBottom()
+        table.setCurrentCell(row, 0)
+        table.selectRow(row)
+        table.editItem(table.item(row, 0))
 
     def _delete_domain_rule(self):
         rows = set()
@@ -217,6 +272,14 @@ class RuleEditorDialog(QDialog):
             except (ValueError, KeyError):
                 QMessageBox.warning(self, "数据错误",
                                     f"IP 规则第 {row + 1} 行: 动作或优先级无效。")
+                return
+            # Validate + normalise the CIDR so a malformed pattern is caught here
+            # rather than silently never matching at runtime.
+            try:
+                pattern = str(ipaddress.ip_network(pattern, strict=False))
+            except ValueError:
+                QMessageBox.warning(self, "数据错误",
+                                    f"IP 规则第 {row + 1} 行: 无效的 CIDR: {pattern}")
                 return
 
             new_ip_rules.append(IpCidrRule(

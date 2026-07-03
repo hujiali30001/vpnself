@@ -89,13 +89,29 @@ class RuleEngine:
         self._ip_rules: list[IpCidrRule] = []
         self.default_action: Action = Action.DIRECT
 
+    # NOTE ON THREAD-SAFETY: the router evaluates rules on the asyncio loop
+    # thread while the GUI thread applies edits. Mutators therefore never edit
+    # the published lists in place -- they build a new sorted list and swap the
+    # attribute in one assignment (atomic under the GIL), so a reader always
+    # sees a complete old-or-new list, never a half-rebuilt one.
+
     def add_domain_rule(self, rule: DomainRule):
-        self._domain_rules.append(rule)
-        self._domain_rules.sort(key=lambda r: r.priority, reverse=True)
+        self._domain_rules = sorted(
+            self._domain_rules + [rule], key=lambda r: r.priority, reverse=True)
 
     def add_ip_rule(self, rule: IpCidrRule):
-        self._ip_rules.append(rule)
-        self._ip_rules.sort(key=lambda r: r.priority, reverse=True)
+        self._ip_rules = sorted(
+            self._ip_rules + [rule], key=lambda r: r.priority, reverse=True)
+
+    def replace_rules(self, domain_rules: list, ip_rules: list,
+                      default_action: "Action | None" = None):
+        """Atomically replace all rules (single-assignment swap per list)."""
+        new_domain = sorted(domain_rules, key=lambda r: r.priority, reverse=True)
+        new_ip = sorted(ip_rules, key=lambda r: r.priority, reverse=True)
+        self._domain_rules = new_domain
+        self._ip_rules = new_ip
+        if default_action is not None:
+            self.default_action = default_action
 
     def remove_domain_rule(self, index: int) -> bool:
         if 0 <= index < len(self._domain_rules):
@@ -110,8 +126,11 @@ class RuleEngine:
         return False
 
     def clear_rules(self):
-        self._domain_rules.clear()
-        self._ip_rules.clear()
+        # Swap in fresh empty lists rather than mutating in place, so a
+        # concurrent reader on the loop thread never sees a cleared list it
+        # is mid-iteration over.
+        self._domain_rules = []
+        self._ip_rules = []
 
     def get_domain_rules(self) -> list[DomainRule]:
         return list(self._domain_rules)
@@ -119,35 +138,48 @@ class RuleEngine:
     def get_ip_rules(self) -> list[IpCidrRule]:
         return list(self._ip_rules)
 
-    def evaluate(self, host: str) -> Action:
-        """Determine the routing action for a given host."""
+    def match_explicit(self, host: str, resolved_ip: str | None = None) -> "Action | None":
+        """Return the first matching rule's action, or None if no rule matched.
+
+        Unlike evaluate(), this distinguishes "a rule matched whose action
+        happens to equal default_action" from "no rule matched at all" -- the
+        caller must honour an explicit match even when it equals the default,
+        instead of letting IP heuristics override it.
+        """
+        # Read attributes into locals once: the lists may be swapped concurrently
+        # by the GUI thread, and this keeps a single consistent snapshot.
+        domain_rules = self._domain_rules
+        ip_rules = self._ip_rules
+
         if is_ip_address(host):
-            for rule in self._ip_rules:
+            for rule in ip_rules:
                 if rule.matches(host):
                     log.debug("IP rule match: %s -> %s (%s)", host, rule.action.value, rule.pattern)
                     return rule.action
 
-        for rule in self._domain_rules:
+        for rule in domain_rules:
             if rule.matches(host):
                 log.debug("Domain rule match: %s -> %s (%s)", host, rule.action.value, rule.pattern)
                 return rule.action
 
-        return self.default_action
-
-    def evaluate_with_ip(self, host: str, resolved_ip: str | None = None) -> Action:
-        """Evaluate routing with optional pre-resolved IP."""
-        action = self.evaluate(host)
-        if action != self.default_action:
-            return action
-
         if resolved_ip and resolved_ip != host:
-            for rule in self._ip_rules:
+            for rule in ip_rules:
                 if rule.matches(resolved_ip):
                     log.debug("IP rule match (resolved): %s (%s) -> %s",
                               host, resolved_ip, rule.action.value)
                     return rule.action
 
-        return action
+        return None
+
+    def evaluate(self, host: str) -> Action:
+        """Determine the routing action for a given host."""
+        action = self.match_explicit(host)
+        return action if action is not None else self.default_action
+
+    def evaluate_with_ip(self, host: str, resolved_ip: str | None = None) -> Action:
+        """Evaluate routing with optional pre-resolved IP."""
+        action = self.match_explicit(host, resolved_ip)
+        return action if action is not None else self.default_action
 
     def load_rules(self, path: str | Path):
         """Load rules from a JSON file."""
@@ -161,27 +193,24 @@ class RuleEngine:
         try:
             with open(p, "r", encoding="utf-8-sig") as f:  # handles BOM
                 data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("rules file root must be a JSON object")
 
-            self.default_action = Action(data.get("default_action", "direct"))
-            self._domain_rules.clear()
-            self._ip_rules.clear()
+            # Parse into locals first; only commit to self after the WHOLE file
+            # parses cleanly, so a malformed entry never leaves rules half-loaded.
+            default_action = Action(data.get("default_action", "direct"))
+            domain_rules = [DomainRule.from_dict(rd) for rd in data.get("domain_rules", [])]
+            ip_rules = [IpCidrRule.from_dict(rd) for rd in data.get("ip_rules", [])]
 
-            for rd in data.get("domain_rules", []):
-                rule = DomainRule.from_dict(rd)
-                self._domain_rules.append(rule)
-
-            for rd in data.get("ip_rules", []):
-                rule = IpCidrRule.from_dict(rd)
-                self._ip_rules.append(rule)
-
-            self._domain_rules.sort(key=lambda r: r.priority, reverse=True)
-            self._ip_rules.sort(key=lambda r: r.priority, reverse=True)
+            self.replace_rules(domain_rules, ip_rules, default_action)
 
             log.info("Loaded %d domain rules + %d IP rules (default action: %s)",
                      len(self._domain_rules), len(self._ip_rules),
                      self.default_action.value)
 
-        except (json.JSONDecodeError, OSError, KeyError) as e:
+        except (ValueError, TypeError, KeyError, AttributeError, OSError) as e:
+            # ValueError covers json.JSONDecodeError and Action('bad') enum lookup;
+            # TypeError/AttributeError cover non-dict entries and bad field types.
             log.error("Failed to load rules: %s, using defaults", e)
             self._load_defaults()
 
@@ -192,8 +221,15 @@ class RuleEngine:
             "domain_rules": [r.to_dict() for r in self._domain_rules],
             "ip_rules": [r.to_dict() for r in self._ip_rules],
         }
-        with open(path, "w", encoding="utf-8") as f:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic write: a crash/kill mid-write must not truncate the live rules
+        # file (which load_rules would then discard, silently wiping all rules).
+        tmp = path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+        import os
+        os.replace(tmp, path)
         log.info("Saved %d domain + %d IP rules to %s",
                  len(self._domain_rules), len(self._ip_rules), path)
 
