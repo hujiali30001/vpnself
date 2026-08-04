@@ -32,6 +32,7 @@ a = Analysis(
         "client.core.geoip",
         "client.core.circuit_breaker",
         "client.config.settings",
+        "client.config.china_ip_data",  # APNIC China IPv4 table (imported by geoip)
         "client.gui.styles",
         "client.gui.rule_editor",
         "client.gui.log_viewer",

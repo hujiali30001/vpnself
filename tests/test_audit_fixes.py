@@ -13,7 +13,8 @@ import struct
 import pytest
 
 from common.protocol import (
-    unpack_frame, pack_frame, Cmd, FRAME_HEADER_SIZE, MAX_FRAME_SIZE,
+    unpack_frame, pack_frame, unpack_connect, pack_connect, Cmd,
+    FRAME_HEADER_SIZE, MAX_FRAME_SIZE,
 )
 from common.utils import ip_in_network
 from client.core.rule_engine import RuleEngine, DomainRule, IpCidrRule, Action
@@ -47,6 +48,25 @@ def test_max_frame_boundary_is_accepted():
     payload = b"x" * (MAX_FRAME_SIZE - FRAME_HEADER_SIZE)
     frame = pack_frame(1, Cmd.DATA, payload)
     assert unpack_frame(frame, 0) == (1, Cmd.DATA, payload)
+
+
+def test_unpack_connect_rejects_empty_host():
+    # An empty host resolves to a machine-dependent address on the server; it
+    # must be rejected at the protocol layer, not left to the SSRF guard.
+    payload = struct.pack("!H", 0) + struct.pack("!H", 443)
+    assert unpack_connect(payload) is None
+
+
+def test_unpack_connect_rejects_port_zero():
+    payload = struct.pack("!H", 3) + b"a.b" + struct.pack("!H", 0)
+    assert unpack_connect(payload) is None
+
+
+def test_unpack_connect_roundtrips_valid_target():
+    # A well-formed CONNECT payload must still parse (guard didn't over-reject).
+    frame = pack_connect(7, "example.com", 443)
+    payload = frame[FRAME_HEADER_SIZE:]
+    assert unpack_connect(payload) == ("example.com", 443)
 
 
 # --- utils --------------------------------------------------------------------
@@ -137,3 +157,32 @@ def test_corrupt_config_backed_up(tmp_path):
     loaded = settings.load_config(p)
     assert loaded["server_port"] == settings.DEFAULT_CONFIG["server_port"]
     assert (tmp_path / "client_config.json.bak").exists()
+
+
+# --- geoip --------------------------------------------------------------------
+
+def test_geoip_does_not_misclassify_foreign_ips_as_china():
+    # The old hand-maintained /5../8 supernets swept in foreign space and routed
+    # it DIRECT into the GFW. These must now be non-China (APNIC-accurate table).
+    from client.core.geoip import is_china_ip
+    for ip in ("43.165.178.174",  # Tencent Japan (was inside 42.0.0.0/7)
+               "37.16.0.0",        # RIPE / Europe (was inside 36.0.0.0/7)
+               "112.196.0.0",      # was inside 112.0.0.0/5
+               "8.8.8.8", "1.1.1.1", "104.16.0.1", "13.107.42.14"):
+        assert not is_china_ip(ip), f"{ip} must NOT classify as China"
+
+
+def test_geoip_still_classifies_genuine_china_ips():
+    from client.core.geoip import is_china_ip
+    for ip in ("114.114.114.114", "223.5.5.5", "119.29.29.29",
+               "180.76.76.76", "1.2.4.8", "36.155.0.1"):
+        assert is_china_ip(ip), f"{ip} must classify as China"
+
+
+def test_default_rules_carry_no_china_ip_cidrs():
+    # China detection lives in the O(log n) is_china_ip() heuristic, not in the
+    # rule set -- so the built-in defaults must not dump thousands of CIDRs into
+    # the linearly-scanned _ip_rules (perf) nor shadow user IP rules (intent).
+    re = RuleEngine()
+    re._load_defaults()
+    assert re.get_ip_rules() == []

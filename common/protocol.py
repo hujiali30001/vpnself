@@ -92,6 +92,14 @@ def unpack_connect(payload: bytes) -> tuple[str, int] | None:
         host_len = struct.unpack("!H", payload[:2])[0]
         host = payload[2:2 + host_len].decode("utf-8")
         port = struct.unpack("!H", payload[2 + host_len:4 + host_len])[0]
+        # Reject a degenerate target here rather than downstream. An empty host
+        # resolves to a machine-dependent address (e.g. a private LAN IP), so
+        # letting it through would lean entirely on the server's SSRF guard to
+        # catch what is plainly a malformed CONNECT. Port 0 is never a real
+        # destination either.
+        if not host or port == 0:
+            log.warning("CONNECT payload has empty host or port 0 -- rejecting")
+            return None
         return host, port
     except (struct.error, UnicodeDecodeError) as e:
         log.warning("Failed to unpack CONNECT payload: %s", e)

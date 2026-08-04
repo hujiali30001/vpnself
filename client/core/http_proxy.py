@@ -114,6 +114,13 @@ class HttpConnectProxy:
                 port = 443
         else:
             host, port = target, 443
+        # Reject a malformed target up front. An out-of-range port would later
+        # raise struct.error in pack_connect (packed as !H, 0..65535) and surface
+        # as a spurious ERROR-with-traceback for what is really a client mistake.
+        if not host or not (1 <= port <= 65535):
+            writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            await writer.drain()
+            return None, None, None, None
         log.debug("HTTP CONNECT #%d: %s:%d", self._total, host, port)
 
         # Discard remaining headers
@@ -166,6 +173,13 @@ class HttpConnectProxy:
             else:
                 host, port = hostpart, 80
         else:
+            writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            await writer.drain()
+            return None, None, None, None
+
+        # Same guard as CONNECT: an out-of-range port must fail fast as a 400,
+        # not blow up later inside pack_connect on the proxy path.
+        if not host or not (1 <= port <= 65535):
             writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
             await writer.drain()
             return None, None, None, None

@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from enum import Enum
 
 from common.utils import get_logger, is_ip_address
-from client.core.geoip import CHINA_IP_RANGES
 
 log = get_logger("client.rule_engine")
 
@@ -321,12 +320,14 @@ class RuleEngine:
                 description=f"Default direct: {pattern}",
             ))
 
-        # China IP CIDR rules (imported from geoip module)
-        for cidr in CHINA_IP_RANGES:
-            self._ip_rules.append(IpCidrRule(
-                pattern=cidr, action=Action.DIRECT, priority=80,
-                description=f"China IP: {cidr}",
-            ))
+        # NOTE: China IP CIDRs are intentionally NOT loaded as explicit rules
+        # here. The router applies is_china_ip() (an O(log n) interval lookup
+        # over the same APNIC-derived table) as a heuristic *after* explicit
+        # rules, which yields the identical DIRECT decision. Dumping ~5.5k CIDRs
+        # into _ip_rules would (a) force a linear ip_in_network() scan of every
+        # entry on each IP lookup, and (b) let a coarse built-in range shadow a
+        # user's higher-intent rule. Keeping them out of the rule set makes
+        # user-defined rules authoritative and the China check cheap.
 
         self._domain_rules.sort(key=lambda r: r.priority, reverse=True)
         self._ip_rules.sort(key=lambda r: r.priority, reverse=True)

@@ -191,6 +191,27 @@ def test_server_dns_cache_hit_and_expiry():
 
 
 @pytest.mark.asyncio
+async def test_connect_out_of_range_port_returns_400():
+    """An out-of-range CONNECT port must fail fast as a 400, not propagate a
+    struct.error out of pack_connect (packed as !H) and log a false ERROR."""
+    from unittest.mock import MagicMock
+    from client.core.http_proxy import HttpConnectProxy
+
+    class _W:
+        def __init__(self): self.buf = b""
+        def write(self, d): self.buf += d
+        async def drain(self): pass
+        def close(self): pass
+        def get_extra_info(self, k, d=None): return ("127.0.0.1", 5555)
+
+    proxy = HttpConnectProxy(router=MagicMock(), host="127.0.0.1", port=0)
+    w = _W()
+    res = await proxy._handle_connect(None, w, "example.com:99999")
+    assert res == (None, None, None, None)
+    assert w.buf.startswith(b"HTTP/1.1 400")
+
+
+@pytest.mark.asyncio
 async def test_stream_partial_read_keeps_remainder():
     """read(n) returns at most n bytes and preserves the rest for the next
     read -- a chunk larger than n must never be silently truncated."""

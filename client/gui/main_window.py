@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from common.utils import get_logger, get_data_path
 from client.core.tunnel import TunnelPool, TunnelConfig, POOL_DEFAULT_SIZE
-from client.core.rule_engine import RuleEngine, Action
+from client.core.rule_engine import RuleEngine
 from client.core.router import Router
 from client.core.http_proxy import HttpConnectProxy
 from client.config.settings import load_config as load_client_config, save_config

@@ -10,7 +10,7 @@ import asyncio
 import time
 
 from common.utils import get_logger, resolve_host, is_ip_address
-from client.core.tunnel import TunnelPool, TunnelClient, TunnelStream, CONNECT_REJECTED
+from client.core.tunnel import TunnelPool, TunnelStream, CONNECT_REJECTED
 from client.core.rule_engine import RuleEngine, Action
 from client.core.geoip import is_china_ip, is_special_ip
 from client.core.circuit_breaker import CircuitBreaker
