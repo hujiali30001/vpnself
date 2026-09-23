@@ -31,6 +31,7 @@ a = Analysis(
         "client.core.rule_engine",
         "client.core.geoip",
         "client.core.circuit_breaker",
+        "client.core.system_proxy",
         "client.config.settings",
         "client.config.china_ip_data",  # APNIC China IPv4 table (imported by geoip)
         "client.gui.styles",

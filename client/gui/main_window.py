@@ -26,6 +26,7 @@ from client.core.tunnel import TunnelPool, TunnelConfig, POOL_DEFAULT_SIZE
 from client.core.rule_engine import RuleEngine
 from client.core.router import Router
 from client.core.http_proxy import HttpConnectProxy
+from client.core.system_proxy import WindowsSystemProxy
 from client.config.settings import load_config as load_client_config, save_config
 from client.gui.styles import MAIN_STYLE, STATUS_LABELS, STAT_LABEL
 from client.gui.rule_editor import RuleEditorDialog
@@ -90,6 +91,7 @@ class MainWindow(QMainWindow):
         self._loop_thread: threading.Thread | None = None
         self._connect_start_time: float = 0
         self._cleaned_up = False
+        self._system_proxy = WindowsSystemProxy()
         self._first_hide_hint_shown = False
         # Throughput sampling state (for rate derivation in _refresh_stats).
         self._last_bytes = (0, 0)
@@ -631,28 +633,10 @@ class MainWindow(QMainWindow):
         """
         http_port = self._config.get("socks5_port", 1080)
         try:
-            import winreg
-            key = winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-                0, winreg.KEY_SET_VALUE
-            )
             if enable:
-                try:
-                    winreg.DeleteValue(key, "ProxyServer")
-                except FileNotFoundError:
-                    pass
-                winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
-                winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ,
-                                  "http=127.0.0.1:%d;https=127.0.0.1:%d" % (http_port, http_port))
+                self._system_proxy.enable(http_port)
             else:
-                winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
-                try:
-                    winreg.DeleteValue(key, "ProxyServer")
-                except FileNotFoundError:
-                    pass
-            winreg.CloseKey(key)
-            self._notify_proxy_change()
+                self._system_proxy.restore()
             label = "HTTP: 127.0.0.1:%d" % http_port if enable else "HTTP: 未启动"
             self.proxy_label_changed.emit(label)
             log.info("系统代理已%s", "设置" if enable else "关闭")
@@ -662,15 +646,6 @@ class MainWindow(QMainWindow):
                 self.proxy_label_changed.emit("HTTP: 127.0.0.1:%d (手动)" % http_port)
         except Exception as e:
             log.warning("%s系统代理失败: %s", "设置" if enable else "关闭", e)
-
-    def _notify_proxy_change(self):
-        """Notify Windows and running apps of proxy configuration change."""
-        try:
-            import ctypes
-            ctypes.windll.wininet.InternetSetOptionW(0, 39, 0, 0)
-            ctypes.windll.wininet.InternetSetOptionW(0, 37, 0, 0)
-        except Exception:
-            pass
 
     # --- 规则编辑器 ---
 

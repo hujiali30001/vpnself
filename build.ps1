@@ -1,6 +1,9 @@
 # Furun VPN Build Script
 # Usage: .\build.ps1 [-Target client|server|all]
-param([string]$Target = "all")
+param(
+    [ValidateSet("client", "server", "all")]
+    [string]$Target = "all"
+)
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root

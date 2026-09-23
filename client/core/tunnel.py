@@ -94,7 +94,10 @@ class TunnelStream:
             self._buffered_bytes -= len(data)
             self._bytes_recv += len(data)
             return data
-        if self._closed:
+        # A CLOSE frame can arrive after DATA frames that are still queued.
+        # Drain those bytes before reporting EOF; only an empty closed stream
+        # can return immediately.
+        if self._closed and self._buffer.empty():
             return b""
         try:
             if n < 0:
@@ -110,6 +113,8 @@ class TunnelStream:
                     except asyncio.QueueEmpty:
                         break
                 if not data:
+                    if self._closed:
+                        return b""
                     data = await self._buffer.get()
                     if data is None:
                         self._closed = True

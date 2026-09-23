@@ -222,3 +222,14 @@ async def test_stream_partial_read_keeps_remainder():
     assert await s.read(100) == b"D_1234"   # remainder, not dropped
     assert s._buffered_bytes == 0
     assert s._bytes_recv == 16              # accounting counts only delivered bytes
+
+
+@pytest.mark.asyncio
+async def test_stream_close_drains_data_received_before_eof():
+    s = TunnelStream(5, tunnel=None)
+    s.feed_data(b"final payload")
+    s.close()
+
+    assert await s.read(5) == b"final"
+    assert await s.read(-1) == b" payload"
+    assert await s.read(-1) == b""

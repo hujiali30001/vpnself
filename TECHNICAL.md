@@ -21,7 +21,7 @@ router.py               --> Rule matching + CB check + DNS cache
   +-- PROXY (overseas IP / rule match)
           |
           v
-      tunnel.py          --> TLS connection pool, 4-16 parallel tunnels
+      tunnel.py          --> TLS connection pool, 128 tunnels by default (configurable 1-128)
           |
           | Binary frame protocol (9-byte header)
           v
@@ -33,7 +33,7 @@ router.py               --> Rule matching + CB check + DNS cache
 
 ## Communication Protocol
 
-Multiple parallel TLS 1.2+ TCP connections carry multiplexed streams via binary frame protocol (big-endian). Client uses a connection pool (default 4 tunnels) with round-robin stream distribution:
+Multiple parallel TLS 1.2+ TCP connections carry multiplexed streams via binary frame protocol (big-endian). Client uses a connection pool (128 tunnels by default, configurable from 1 to 128) with round-robin stream distribution:
 
 ```
 [0:4] uint32  Total length (header + payload)
@@ -145,7 +145,7 @@ Server-side `_handle_client` wraps `reader.read()` with `asyncio.wait_for(timeou
 
 ### Connection Pool
 
-The client maintains N parallel TLS tunnels to the server (configurable, default 4):
+The client maintains N parallel TLS tunnels to the server (configurable from 1 to 128, default 128):
 
 - **Distribution**: Round-robin across connected tunnels, skipping any that are down
 - **Fault tolerance**: Each tunnel auto-reconnects independently on failure
