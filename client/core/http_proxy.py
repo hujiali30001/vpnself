@@ -8,6 +8,7 @@ DNS resolves on server side (Japan), eliminating local-DNS issues.
 import asyncio
 from common.utils import get_logger
 from client.core.router import Router
+from client.core.tunnel import IO_CHUNK_SIZE
 
 log = get_logger("client.http_proxy")
 
@@ -231,7 +232,7 @@ class HttpConnectProxy:
             total = 0
             try:
                 while self._running:
-                    data = await src.read(65536)
+                    data = await src.read(IO_CHUNK_SIZE)
                     if not data:
                         break
                     dst.write(data)

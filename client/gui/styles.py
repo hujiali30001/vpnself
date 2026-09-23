@@ -273,6 +273,49 @@ QProgressBar::chunk {
     background-color: #89b4fa;
     border-radius: 3px;
 }
+
+QDialog {
+    background-color: #1e1e2e;
+    color: #cdd6f4;
+}
+
+QTabWidget::pane {
+    border: 1px solid #45475a;
+    border-radius: 4px;
+    background-color: #1e1e2e;
+    top: -1px;
+}
+
+QTabWidget::tab-bar {
+    alignment: left;
+}
+
+QTabBar::tab {
+    background-color: #313244;
+    color: #a6adc8;
+    border: 1px solid #45475a;
+    border-bottom: none;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
+    padding: 6px 16px;
+    margin-right: 2px;
+    min-width: 60px;
+}
+
+QTabBar::tab:selected {
+    background-color: #1e1e2e;
+    color: #cdd6f4;
+    border-bottom: 2px solid #89b4fa;
+}
+
+QTabBar::tab:hover:!selected {
+    background-color: #45475a;
+    color: #cdd6f4;
+}
+
+QTabBar::tab:disabled {
+    color: #6c7086;
+}
 """
 
 STATUS_LABELS = {

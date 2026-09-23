@@ -10,7 +10,7 @@ import asyncio
 import time
 
 from common.utils import get_logger, resolve_host, is_ip_address
-from client.core.tunnel import TunnelPool, TunnelStream, CONNECT_REJECTED
+from client.core.tunnel import TunnelPool, TunnelStream, CONNECT_REJECTED, IO_CHUNK_SIZE
 from client.core.rule_engine import RuleEngine, Action
 from client.core.geoip import is_china_ip, is_special_ip
 from client.core.circuit_breaker import CircuitBreaker
@@ -42,7 +42,9 @@ class _TunnelStreamWriter:
                 finally:
                     self._drained.set()
         except asyncio.CancelledError:
-            pass
+            qsize = self._queue.qsize()
+            if qsize:
+                log.debug("TunnelStreamWriter _send_loop cancelled with %d item(s) still queued", qsize)
 
     def write(self, data: bytes):
         if not self._closed and data:
@@ -58,8 +60,10 @@ class _TunnelStreamWriter:
             self._queue.put_nowait(None)
             if not self._sender.done():
                 self._sender.cancel()
-            self._close_task = asyncio.create_task(
+            t = asyncio.create_task(
                 self._tunnel.close_stream(self._stream.stream_id))
+            t.add_done_callback(lambda _: None)  # suppress "Task destroyed but pending!" noise
+            self._close_task = t
 
     @property
     def transport(self):
@@ -89,7 +93,7 @@ class _TunnelStreamReader(asyncio.StreamReader):
     async def _feed(self):
         try:
             while not self._stream.closed:
-                data = await self._stream.read(65536)
+                data = await self._stream.read(IO_CHUNK_SIZE)
                 if not data:
                     break
                 self.feed_data(data)

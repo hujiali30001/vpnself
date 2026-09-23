@@ -25,6 +25,14 @@ DRAIN_TIMEOUT = 15.0
 SERVER_DNS_TTL = 300.0       # seconds a resolved host stays cached
 SERVER_DNS_CACHE_MAX = 2048  # cap entries to bound memory
 
+# SSRF guard: addresses that resolve to CGNAT (RFC 6598) or the 0.0.0.0/8
+# "This network" block are not reachable public internet targets.
+# ipaddress.is_private covers RFC1918 / loopback / link-local but not these.
+_SSRF_BLOCKED = [
+    ipaddress.ip_network("100.64.0.0/10"),  # CGNAT (RFC 6598)
+    ipaddress.ip_network("0.0.0.0/8"),      # "This network" (RFC 1122)
+]
+
 
 async def send_frame_locked(writer: asyncio.StreamWriter,
                             write_lock: "asyncio.Lock | None",
@@ -64,7 +72,9 @@ async def send_frame_locked(writer: asyncio.StreamWriter,
 class ForwardRelay:
     """Bidirectional relay between a tunnel stream and a target TCP connection."""
 
-    BUFFER_SIZE = 65536
+    # Large sequential responses (model files) benefit substantially from
+    # fewer asyncio wakeups and fewer locked tunnel writes.
+    BUFFER_SIZE = 256 * 1024
 
     def __init__(self, stream_id: int, tunnel_writer: asyncio.StreamWriter,
                  target_reader: asyncio.StreamReader,
@@ -236,6 +246,10 @@ class ForwardProxy:
                 if sock is not None:
                     try:
                         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF,
+                                        4 * 1024 * 1024)
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF,
+                                        4 * 1024 * 1024)
                     except (OSError, AttributeError):
                         pass
 
@@ -285,7 +299,8 @@ class ForwardProxy:
         ip = info[0][4][0]
         addr = ipaddress.ip_address(ip)
         if (addr.is_private or addr.is_loopback or addr.is_link_local
-                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified
+                or any(addr in net for net in _SSRF_BLOCKED)):
             raise OSError(f"refusing non-public target {host} -> {ip}")
         return ip
 

@@ -128,7 +128,7 @@ def setup_logging(name: str = "furun",
         logger.addHandler(qt_handler)
 
     # Suppress noisy third-party loggers
-    for lib in ("asyncio", "PIL", "matplotlib"):
+    for lib in ("asyncio", "PIL", "matplotlib", "urllib3", "aiohttp"):
         logging.getLogger(lib).setLevel(logging.WARNING)
 
     return logger
@@ -154,6 +154,21 @@ def get_data_path(*parts: str) -> Path:
         base = Path(__file__).parent.parent
     return base.joinpath(*parts)
 
+# --- Formatting Helpers ---
+
+def human_bytes(n: int) -> str:
+    """Format a byte count as a human-readable string (e.g. '1.2 MB').
+
+    Uses IEC binary prefixes (1 KB = 1024 bytes).
+    """
+    v = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if v < 1024 or unit == "TB":
+            return f"{v:.0f} {unit}" if unit == "B" else f"{v:.1f} {unit}"
+        v /= 1024
+    return f"{v:.1f} TB"  # unreachable; satisfies type checkers
+
+
 # --- Network Helpers ---
 
 def is_ip_address(host: str) -> bool:
@@ -176,8 +191,8 @@ def resolve_host(host: str, port: int = 80) -> str:
         info = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
         if info:
             return info[0][4][0]
-    except (socket.gaierror, OSError):
-        pass
+    except (socket.gaierror, OSError) as e:
+        log.debug("resolve_host: DNS lookup failed for %s: %s -- returning original", host, e)
     return host
 
 

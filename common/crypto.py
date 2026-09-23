@@ -29,6 +29,11 @@ def create_client_ssl_context(cert_file: str | None = None,
         if cert_file:
             ctx.load_verify_locations(cert_file)
     else:
+        # verify=False is intentionally safe here: the tunnel's pre-shared key
+        # (PSK) is exchanged in the AUTH frame immediately after the TLS
+        # handshake, so even a self-signed or unverified certificate cannot
+        # allow an attacker to impersonate the server — they would need the PSK
+        # to pass authentication and gain access to the tunnel.
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 

@@ -113,14 +113,16 @@ class RuleEngine:
             self.default_action = default_action
 
     def remove_domain_rule(self, index: int) -> bool:
-        if 0 <= index < len(self._domain_rules):
-            self._domain_rules.pop(index)
+        rules = self._domain_rules
+        if 0 <= index < len(rules):
+            self._domain_rules = rules[:index] + rules[index + 1:]
             return True
         return False
 
     def remove_ip_rule(self, index: int) -> bool:
-        if 0 <= index < len(self._ip_rules):
-            self._ip_rules.pop(index)
+        rules = self._ip_rules
+        if 0 <= index < len(rules):
+            self._ip_rules = rules[:index] + rules[index + 1:]
             return True
         return False
 

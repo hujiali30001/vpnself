@@ -8,7 +8,7 @@ import html
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPlainTextEdit,
-    QPushButton, QCheckBox, QLineEdit, QLabel,
+    QPushButton, QCheckBox, QLineEdit, QLabel, QFileDialog,
 )
 from PyQt6.QtGui import QFont
 
@@ -32,6 +32,8 @@ class LogViewer(QWidget):
         self._auto_scroll = True
         self._all_lines: list[tuple[str, str]] = []  # (message, level)
         self._filter_text = ""
+        self._prev_filter = None   # (filter_text, show_debug) — skip rebuild when unchanged
+        self._truncated = False    # True once the buffer has been capped at MAX_LINES
         self._build_ui()
 
     def _build_ui(self):
@@ -61,6 +63,10 @@ class LogViewer(QWidget):
         clear_btn = QPushButton("清空")
         clear_btn.clicked.connect(self.clear)
         ctrl_layout.addWidget(clear_btn)
+
+        export_btn = QPushButton("导出日志")
+        export_btn.clicked.connect(self._export_log)
+        ctrl_layout.addWidget(export_btn)
         layout.addLayout(ctrl_layout)
 
         self.text_edit = QPlainTextEdit()
@@ -92,10 +98,20 @@ class LogViewer(QWidget):
 
     def _apply_filter(self):
         """Rebuild display content based on the debug toggle and text filter."""
+        key = (self._filter_text, self.show_debug_cb.isChecked())
+        if key == self._prev_filter:
+            return
+        self._prev_filter = key
         self.text_edit.clear()
         for message, level in self._all_lines:
             if self._visible(message, level):
                 self._append_html(message, level)
+        if self._truncated:
+            self.text_edit.appendHtml(
+                '<span style="color:#6c7086;">'
+                f'(日志已截断至最近 {self.MAX_LINES} 条)'
+                '</span>'
+            )
         if self._auto_scroll:
             sb = self.text_edit.verticalScrollBar()
             sb.setValue(sb.maximum())
@@ -106,6 +122,14 @@ class LogViewer(QWidget):
         # long-running session does not grow _all_lines without bound.
         if len(self._all_lines) > self.MAX_LINES:
             del self._all_lines[:len(self._all_lines) - self.MAX_LINES]
+            if not self._truncated:
+                self._truncated = True
+                self._prev_filter = None  # force rebuild on next filter change
+                self.text_edit.appendHtml(
+                    f'<span style="color:#6c7086;">'
+                    f'(日志已截断至最近 {self.MAX_LINES} 条)'
+                    f'</span>'
+                )
         if not self._visible(message, level):
             return
         self._append_html(message, level)
@@ -117,8 +141,24 @@ class LogViewer(QWidget):
         """Return the full retained history (all levels), for export."""
         return "\n".join(msg for msg, _ in self._all_lines)
 
+    def _export_log(self):
+        """Save the full log history to a user-chosen file."""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "导出日志", "furun_log.txt",
+            "文本文件 (*.txt *.log);;所有文件 (*)"
+        )
+        if not file_path:
+            return
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(self.get_full_text())
+        except OSError:
+            pass  # silently ignore; parent window handles its own export errors
+
     def clear(self):
         self._all_lines.clear()
+        self._truncated = False
+        self._prev_filter = None
         self.text_edit.clear()
 
     def set_show_debug(self, show: bool):

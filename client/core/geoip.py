@@ -109,7 +109,7 @@ def load_china_ip_list(file_path: str) -> int:
         if not p.exists():
             return 0
         with open(p, "r", encoding="utf-8-sig") as f:
-            count = 0
+            new_cidrs = []
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#"):
@@ -118,11 +118,19 @@ def load_china_ip_list(file_path: str) -> int:
                     except ValueError:
                         log.warning("Skipping invalid CIDR in %s: %s", file_path, line)
                         continue
-                    CHINA_IP_RANGES.append(line)
-                    count += 1
-            if count > 0:
-                _CHINA_SET.rebuild(CHINA_IP_RANGES)
-                log.info("Loaded %d additional China IP ranges from %s", count, file_path)
+                    new_cidrs.append(line)
+            count = len(new_cidrs)
+            if count == 0:
+                return 0
+            # Atomic swap: build new merged set, then replace module globals in
+            # two pointer-sized assignments (each atomic under the GIL), so a
+            # concurrent is_china_ip() call always sees a consistent pair.
+            new_ranges = list(CHINA_IP_RANGES) + new_cidrs
+            new_set = _IntervalSet(new_ranges)
+            CHINA_IP_RANGES[:] = new_ranges          # update in-place for any holders of the reference
+            _CHINA_SET._starts = new_set._starts
+            _CHINA_SET._ends = new_set._ends
+            log.info("Loaded %d additional China IP ranges from %s", count, file_path)
             return count
     except OSError as e:
         log.warning("Failed to load China IP list from %s: %s", file_path, e)

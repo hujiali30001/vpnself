@@ -15,6 +15,16 @@ from common.utils import get_logger
 
 log = get_logger("protocol")
 
+__all__ = [
+    "Cmd", "FRAME_HEADER_SIZE", "MAX_FRAME_SIZE",
+    "pack_frame", "unpack_frame",
+    "pack_auth", "pack_auth_ok",
+    "pack_connect", "unpack_connect",
+    "pack_connect_ok", "pack_connect_fail",
+    "pack_data", "pack_close",
+    "pack_ping", "pack_pong",
+]
+
 # Protocol constants
 FRAME_HEADER_SIZE = 9  # 4 (length) + 4 (stream_id) + 1 (cmd)
 MAX_FRAME_SIZE = 4 * 1024 * 1024  # 4 MB -- reject obviously corrupt frames
@@ -48,6 +58,13 @@ def unpack_frame(data: bytes, offset: int = 0) -> tuple[int, Cmd, bytes] | None:
     Returns (stream_id, cmd, payload) or None if more bytes are needed. Parsing
     is done in place via ``offset`` so read loops never re-slice ``buf[pos:]``
     once per frame (which is O(n^2) when a single read holds many frames).
+
+    IMPORTANT: callers MUST advance their read position by
+    ``FRAME_HEADER_SIZE + len(payload)`` after consuming a frame, NOT by the
+    raw ``total_len`` field from the header. On the resync path (oversized /
+    undersized total_len) the returned payload is empty and the frame is only
+    FRAME_HEADER_SIZE bytes wide, so advancing by total_len would skip or
+    re-parse valid data.
     """
     if len(data) - offset < FRAME_HEADER_SIZE:
         return None
@@ -129,6 +146,11 @@ def pack_close(stream_id: int) -> bytes:
 def pack_ping() -> bytes:
     """Pack a PING frame."""
     return pack_frame(0, Cmd.PING)
+
+
+def pack_auth_ok() -> bytes:
+    """Pack an AUTH_OK frame (stream 0, no payload)."""
+    return pack_frame(0, Cmd.AUTH_OK)
 
 
 def pack_pong() -> bytes:

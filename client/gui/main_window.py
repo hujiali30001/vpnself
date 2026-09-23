@@ -21,7 +21,7 @@ from PyQt6.QtGui import QAction, QIcon, QCloseEvent, QPixmap, QPainter, QColor, 
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from common.utils import get_logger, get_data_path
+from common.utils import get_logger, get_data_path, human_bytes
 from client.core.tunnel import TunnelPool, TunnelConfig, POOL_DEFAULT_SIZE
 from client.core.rule_engine import RuleEngine
 from client.core.router import Router
@@ -71,6 +71,8 @@ class MainWindow(QMainWindow):
     # Proxy label text, emitted from the asyncio thread so the QLabel is only
     # ever touched on the GUI thread (see _set_system_proxy).
     proxy_label_changed = pyqtSignal(str)
+    # Test-connection result: (success, human-readable message).
+    _test_result = pyqtSignal(bool, str)
 
     def __init__(self):
         super().__init__()
@@ -232,6 +234,11 @@ class MainWindow(QMainWindow):
         self.rate_label.setToolTip("实时上传/下载速率")
         stats_layout.addWidget(self.rate_label)
 
+        self.bytes_label = QLabel("↑ 0 B  ↓ 0 B")
+        self.bytes_label.setStyleSheet(STAT_LABEL)
+        self.bytes_label.setToolTip("累计上传/下载流量")
+        stats_layout.addWidget(self.bytes_label)
+
         stats_layout.addStretch()
 
         self.tunnel_status_label = QLabel("隧道: --")
@@ -257,6 +264,11 @@ class MainWindow(QMainWindow):
         self.connect_btn.setMinimumWidth(140)
         self.connect_btn.clicked.connect(self._toggle_connection)
         bottom_layout.addWidget(self.connect_btn)
+
+        self.test_btn = QPushButton("测试连接")
+        self.test_btn.setToolTip("不建立完整隧道，仅测试服务器是否可达")
+        self.test_btn.clicked.connect(self._test_connection)
+        bottom_layout.addWidget(self.test_btn)
 
         bottom_layout.addStretch()
 
@@ -299,10 +311,71 @@ class MainWindow(QMainWindow):
         self.stats_updated.connect(self._on_stats_updated)
         self.log_message.connect(self._on_log_message)
         self.proxy_label_changed.connect(self.proxy_label.setText)
+        self._test_result.connect(self._on_test_result)
 
     def _toggle_psk_echo(self, show: bool):
         self.psk_input.setEchoMode(
             QLineEdit.EchoMode.Normal if show else QLineEdit.EchoMode.Password)
+
+    def _test_connection(self):
+        """Kick off a lightweight reachability probe without building a full pool."""
+        host = self.host_input.text().strip()
+        if not host:
+            QMessageBox.warning(self, "配置错误", "请先填写服务器地址。")
+            return
+        port_text = self.port_input.text().strip()
+        try:
+            port = int(port_text)
+        except ValueError:
+            QMessageBox.warning(self, "配置错误", "端口必须为 1-65535 的整数。")
+            return
+        if not (1 <= port <= 65535):
+            QMessageBox.warning(self, "配置错误", "端口必须在 1-65535 范围内。")
+            return
+
+        self.test_btn.setEnabled(False)
+        self.test_btn.setText("测试中...")
+        self._start_async_loop()
+        self._run_async(self._test_connection_async(host, port))
+
+    async def _test_connection_async(self, host: str, port: int):
+        """Open a raw TCP connection and optionally send a TLS client-hello."""
+        import asyncio
+        import ssl as ssl_mod
+        timeout = 8.0
+        try:
+            verify = self._config.get("verify_cert", False)
+            ctx = ssl_mod.create_default_context()
+            if not verify:
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl_mod.CERT_NONE
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port, ssl=ctx),
+                timeout=timeout,
+            )
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            self._test_result.emit(True, f"成功：{host}:{port} 可达，TLS 握手正常")
+        except asyncio.TimeoutError:
+            self._test_result.emit(False, f"超时：{timeout:.0f} 秒内无法连接 {host}:{port}")
+        except OSError as e:
+            self._test_result.emit(False, f"网络错误：{e}")
+        except ssl_mod.SSLError as e:
+            # TCP is reachable but TLS failed — still useful info.
+            self._test_result.emit(True, f"TCP 可达，但 TLS 错误：{e.reason}")
+        except Exception as e:
+            self._test_result.emit(False, f"测试失败：{e}")
+
+    def _on_test_result(self, ok: bool, message: str):
+        self.test_btn.setEnabled(True)
+        self.test_btn.setText("测试连接")
+        if ok:
+            QMessageBox.information(self, "连接测试", message)
+        else:
+            QMessageBox.warning(self, "连接测试", message)
 
     # --- 异步循环 ---
 
@@ -673,6 +746,7 @@ class MainWindow(QMainWindow):
             self.proxy_label.setText("HTTP: 未启动")
             self._running = False
             self._connect_start_time = 0
+            self.bytes_label.setText("↑ 0 B  ↓ 0 B")
             self.tray.setIcon(_make_tray_icon(TRAY_DISCONNECTED))
             self.tray.setToolTip("Furun VPN — " + ("连接失败" if failed else "未连接"))
             if failed:
@@ -722,9 +796,12 @@ class MainWindow(QMainWindow):
         self.cb_label.setText(
             f"熔断: 阻断 {stats.get('cb_blocked_ips', 0)} / 跟踪 {stats.get('cb_tracked', 0)}")
 
-        # Derive an up/down rate from the cumulative byte deltas.
+        # Cumulative totals.
         up = stats.get("bytes_up", 0)
         down = stats.get("bytes_down", 0)
+        self.bytes_label.setText(f"↑ {human_bytes(up)}  ↓ {human_bytes(down)}")
+
+        # Derive an up/down rate from the cumulative byte deltas.
         now = time.monotonic()
         dt = now - self._last_bytes_time if self._last_bytes_time else 0
         if dt >= 0.5:

@@ -23,6 +23,12 @@ HEALTH_CHECK_INTERVAL = 10.0  # How often to check connection health
 HEALTH_TIMEOUT = 50.0  # Max time without receiving data before considering dead
 WRITE_DRAIN_TIMEOUT = 15.0  # Max time one frame write may block before the
                             # tunnel is declared dead (mirrors server side)
+# A model download is a small number of very large, long-lived streams.  The
+# old 64 KiB read size caused every stream to be split into thousands of TLS
+# writes/frames and made the shared tunnel spend most of its time in drain().
+# Keep frames below MAX_FRAME_SIZE while reducing per-frame scheduling overhead.
+IO_CHUNK_SIZE = 256 * 1024
+SOCKET_BUFFER_SIZE = 4 * 1024 * 1024
 
 # Sentinel distinguishing a SERVER-side target rejection (CONNECT_FAIL: DNS or
 # connect failure) from a tunnel-level miss. A rejection is host-specific --
@@ -199,6 +205,10 @@ class TunnelClient:
                 if sock is not None:
                     try:
                         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF,
+                                        SOCKET_BUFFER_SIZE)
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF,
+                                        SOCKET_BUFFER_SIZE)
                     except (OSError, AttributeError):
                         pass
                 auth_frame = pack_auth(self.config.psk)
@@ -409,7 +419,7 @@ class TunnelClient:
         pos = 0
         try:
             while self._running:
-                data = await self._reader.read(65536)
+                data = await self._reader.read(IO_CHUNK_SIZE)
                 if not data:
                     log.warning("TUNNEL: read EOF -- server closed connection")
                     break

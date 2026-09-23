@@ -133,11 +133,11 @@ class TunnelServer:
 
         try:
             while self._running:
-                data = await asyncio.wait_for(reader.read(65536), timeout=self.config.get("idle_timeout", 120))
+                data = await asyncio.wait_for(reader.read(256 * 1024), timeout=self.config.get("idle_timeout", 120))
                 if not data:
                     log.info("[CLIENT %s:%d] TCP EOF (read returned empty)", peer[0], peer[1])
                     break
-                if pos > 0:
+                if pos > 65536 or (pos > 0 and pos > len(buf) // 2):
                     buf = buf[pos:]
                     pos = 0
                 buf += data
@@ -253,6 +253,7 @@ class TunnelServer:
                             task = active_streams.pop(stream_id, None)
                             if task and not task.done():
                                 task.cancel()
+                            pending_data.pop(stream_id, None)
                         elif stream_id in active_streams:
                             log.debug("[CLIENT %s:%d] Frame #%d: [S%d] CLOSE DEFERRED (connect pending)",
                                      peer[0], peer[1], frame_count, stream_id)
